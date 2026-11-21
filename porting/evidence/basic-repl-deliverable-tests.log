@@ -1,0 +1,22 @@
+TTY STARTUP OUTPUT:
+Welcome to the magnificent Rust Python 0.6.1 interpreter �� ��
+RustPython3.15.0
+Type "help", "copyright", "credits" or "license" for more information.
+>>>
+PASS: bare TTY launch reaches basic prompt without importing _pyrepl
+INTERACTIVE EXIT: 0 
+Hello, World!
+42
+LOOP 0
+LOOP 1
+AFTER_ERROR
+Welcome to the magnificent Rust Python 0.6.1 interpreter 😱 🖖
+RustPython 3.15.0
+Type "help", "copyright", "credits" or "license" for more information.
+>>> >>> >>> >>> ... ... >>> Traceback (most recent call last):
+  File "<stdin-4>", line 1, in <module>
+ZeroDivisionError: division by zero
+>>> >>> 
+PASS: interactive commands, multiline input, state and error recovery
+SCRIPT EXIT: 0 'Hello, World!\n' 
+PASS: script file with spaces and CRLF prints Hello, World!

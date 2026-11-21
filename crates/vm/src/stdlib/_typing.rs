@@ -1,0 +1,560 @@
+// spell-checker:ignore typevarobject funcobj typevartuples
+use crate::{
+    AsObject, Context, PyObject, PyResult, VirtualMachine,
+    builtins::{PyStr, pystr::AsPyStr},
+    class::PyClassImpl,
+    common::wtf8::Wtf8Buf,
+    function::{Either, IntoFuncArgs},
+};
+
+pub use crate::stdlib::typevar::{
+    Generic, ParamSpec, ParamSpecArgs, ParamSpecKwargs, TypeVar, TypeVarTuple,
+    set_typeparam_default,
+};
+pub(crate) use decl::module_def;
+pub use decl::*;
+
+/// Initialize typing types (call extend_class)
+pub fn init(ctx: &'static Context) {
+    NoDefault::extend_class(ctx, ctx.types.typing_no_default_type);
+}
+
+pub fn call_typing_func_object<'a>(
+    vm: &VirtualMachine,
+    func_name: impl AsPyStr<'a>,
+    args: impl IntoFuncArgs,
+) -> PyResult {
+    let module = vm.import("typing", 0)?;
+    let func = module.get_attr(func_name.as_pystr(&vm.ctx), vm)?;
+    func.call(args, vm)
+}
+
+/// Write the shared type representation used by aliases, unions and annotations.
+/// Equivalent of _Py_typing_type_repr.
+pub(crate) fn typing_type_repr(
+    writer: &mut Wtf8Buf,
+    obj: &PyObject,
+    vm: &VirtualMachine,
+) -> PyResult<()> {
+    if obj.is(&vm.ctx.ellipsis) {
+        writer.push_str("...");
+        return Ok(());
+    }
+    if obj.is(vm.ctx.types.none_type) {
+        writer.push_str("None");
+        return Ok(());
+    }
+
+    // has_attr releases each temporary value before the next lookup or repr.
+    if obj.has_attr(identifier!(vm, __origin__), vm)?
+        && obj.has_attr(identifier!(vm, __args__), vm)?
+    {
+        writer.push_wtf8(obj.repr(vm)?.as_object().str(vm)?.as_wtf8());
+        return Ok(());
+    }
+
+    let Some(qualname) = vm.get_attribute_opt(obj, identifier!(vm, __qualname__))? else {
+        writer.push_wtf8(obj.repr(vm)?.as_object().str(vm)?.as_wtf8());
+        return Ok(());
+    };
+    let module = vm.get_attribute_opt(obj, identifier!(vm, __module__))?;
+    let result = (|| {
+        let Some(module) = module.as_ref().filter(|module| !vm.is_none(module)) else {
+            return obj.repr(vm).map(Either::A);
+        };
+        if module
+            .downcast_ref::<PyStr>()
+            .is_some_and(|module| module.as_wtf8() == "builtins")
+        {
+            return qualname.str(vm).map(Either::A);
+        }
+        let mut repr = module.str(vm)?.as_wtf8().to_owned();
+        repr.push_str(".");
+        repr.push_wtf8(qualname.str(vm)?.as_wtf8());
+        Ok(Either::B(repr))
+    })();
+    // Attribute values can own finalizers; release them in lookup order,
+    // before releasing the string returned by __str__ or __repr__.
+    drop(qualname);
+    drop(module);
+    match result? {
+        // PyUnicodeWriter_WriteStr applies str() to a returned str subclass.
+        Either::A(repr) => writer.push_wtf8(repr.as_object().str(vm)?.as_wtf8()),
+        Either::B(repr) => writer.push_wtf8(&repr),
+    }
+    Ok(())
+}
+
+#[pymodule(name = "_typing", with(super::typevar::typevar))]
+pub(crate) mod decl {
+    use super::typing_type_repr;
+    use crate::class::PyClassDef;
+    use crate::common::lock::LazyLock;
+    use crate::{
+        AsObject, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyResult, VirtualMachine,
+        atomic_func,
+        builtins::{
+            PyFunction, PyGenericAlias, PyStrRef, PyTuple, PyTupleRef, PyType, PyTypeRef, type_,
+        },
+        common::wtf8::Wtf8Buf,
+        function::{FuncArgs, OptionalArg, PySetterValue},
+        protocol::{PyMappingMethods, PyNumberMethods},
+        types::{AsMapping, AsNumber, Callable, Constructor, Iterable, Representable},
+    };
+
+    #[pyfunction]
+    pub(crate) fn _idfunc(x: PyObjectRef) -> PyObjectRef {
+        x
+    }
+
+    #[pyfunction(name = "override")]
+    pub(crate) fn r#override(func: PyObjectRef, vm: &VirtualMachine) -> PyObjectRef {
+        // Set __override__ attribute to True
+        // Skip the attribute silently if it is not writable.
+        // AttributeError happens if the object has __slots__ or a
+        // read-only property, TypeError if it's a builtin class.
+        let _ = func.set_attr("__override__", vm.ctx.true_value.clone(), vm);
+        func
+    }
+
+    #[pyclass(no_attr, name = "NoDefaultType", module = "typing")]
+    #[derive(Debug, PyPayload)]
+    pub struct NoDefault;
+
+    #[pyclass(with(Constructor, Representable), flags(IMMUTABLETYPE))]
+    impl Py<NoDefault> {
+        #[pymethod]
+        fn __reduce__(&self, _vm: &VirtualMachine) -> String {
+            "NoDefault".to_owned()
+        }
+    }
+
+    impl Constructor for NoDefault {
+        type Args = ();
+
+        fn slot_new(_cls: PyTypeRef, args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+            let _: () = args.bind_for(vm, Self::NAME)?;
+            Ok(vm.ctx.typing_no_default.clone().into())
+        }
+
+        fn py_new(_cls: &Py<PyType>, _args: Self::Args, _vm: &VirtualMachine) -> PyResult<Self> {
+            unreachable!("NoDefault is a singleton, use slot_new")
+        }
+    }
+
+    impl Representable for NoDefault {
+        #[inline(always)]
+        fn repr_str(_zelf: &Py<Self>, _vm: &VirtualMachine) -> PyResult<String> {
+            Ok("typing.NoDefault".to_owned())
+        }
+    }
+
+    #[pyattr]
+    #[pyclass(name = "_ConstEvaluator", module = "_typing")]
+    #[derive(Debug, PyPayload)]
+    pub(crate) struct ConstEvaluator {
+        value: PyObjectRef,
+    }
+
+    #[pyclass(with(Constructor, Callable, Representable), flags(IMMUTABLETYPE))]
+    impl ConstEvaluator {}
+
+    impl Constructor for ConstEvaluator {
+        type Args = FuncArgs;
+
+        fn slot_new(_cls: PyTypeRef, _args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+            Err(vm.new_type_error("cannot create '_typing._ConstEvaluator' instances"))
+        }
+
+        fn py_new(_cls: &Py<PyType>, _args: Self::Args, _vm: &VirtualMachine) -> PyResult<Self> {
+            unreachable!("ConstEvaluator cannot be instantiated from Python")
+        }
+    }
+
+    /// annotationlib.Format.STRING = 4
+    const ANNOTATE_FORMAT_STRING: i32 = 4;
+
+    impl Callable for ConstEvaluator {
+        type Args = FuncArgs;
+
+        fn call(zelf: &Py<Self>, args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+            let (format,): (i32,) = args.bind(vm)?;
+            let value = &zelf.value;
+            if format == ANNOTATE_FORMAT_STRING {
+                return typing_type_repr_value(value, vm);
+            }
+            Ok(value.clone())
+        }
+    }
+
+    /// Format a value as a string for ANNOTATE_FORMAT_STRING.
+    /// Handles tuples specially by wrapping in parentheses.
+    fn typing_type_repr_value(value: &PyObject, vm: &VirtualMachine) -> PyResult {
+        let mut repr = Wtf8Buf::new();
+        if let Some(tuple) = value.downcast_ref::<PyTuple>() {
+            repr.push_str("(");
+            for (i, item) in tuple.as_slice().iter().enumerate() {
+                if i > 0 {
+                    repr.push_str(", ");
+                }
+                typing_type_repr(&mut repr, item, vm)?;
+            }
+            repr.push_str(")");
+        } else {
+            typing_type_repr(&mut repr, value, vm)?;
+        }
+        Ok(vm.ctx.new_str(repr).into())
+    }
+
+    impl Representable for ConstEvaluator {
+        fn repr_wtf8(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<Wtf8Buf> {
+            let mut repr = Wtf8Buf::from("<constevaluator ");
+            repr.push_wtf8(zelf.value.repr(vm)?.as_wtf8());
+            repr.push_str(">");
+            Ok(repr)
+        }
+    }
+
+    pub(crate) fn const_evaluator_alloc(value: PyObjectRef, vm: &VirtualMachine) -> PyObjectRef {
+        ConstEvaluator { value }.into_ref(&vm.ctx).into()
+    }
+
+    #[pyattr]
+    #[pyclass(name, module = "typing")]
+    #[derive(Debug, PyPayload)]
+    pub(crate) struct TypeAliasType {
+        #[pymember(name = "__name__")]
+        name: PyStrRef,
+        #[pymember(name = "__qualname__")]
+        qualname: PyStrRef,
+        type_params: PyTupleRef,
+        compute_value: PyObjectRef,
+        cached_value: crate::common::lock::PyMutex<Option<PyObjectRef>>,
+        module: crate::common::lock::PyMutex<Option<PyObjectRef>>,
+        is_lazy: bool,
+    }
+    #[derive(FromArgs)]
+    pub(crate) struct TypeAliasArgs {
+        #[pyarg(any)]
+        name: PyObjectRef,
+        #[pyarg(any)]
+        value: PyObjectRef,
+        #[pyarg(named, optional, py_default = "()")]
+        type_params: OptionalArg<PyObjectRef>,
+        #[pyarg(named, optional, py_default = "None")]
+        qualname: OptionalArg<PyObjectRef>,
+    }
+
+    impl TypeAliasType {
+        /// Create from intrinsic: compute_value is a callable that returns the value
+        pub(crate) fn new(
+            name: PyStrRef,
+            type_params: PyTupleRef,
+            compute_value: PyObjectRef,
+        ) -> Self {
+            let qualname = compute_value
+                .downcast_ref::<PyFunction>()
+                .expect("type alias evaluator must be a function")
+                .code
+                .qualname
+                .to_owned();
+            Self {
+                name,
+                qualname,
+                type_params,
+                compute_value,
+                cached_value: crate::common::lock::PyMutex::new(None),
+                module: crate::common::lock::PyMutex::new(None),
+                is_lazy: true,
+            }
+        }
+
+        /// Create with an eagerly evaluated value (used by constructor)
+        fn new_eager(
+            name: PyStrRef,
+            qualname: PyStrRef,
+            type_params: PyTupleRef,
+            value: PyObjectRef,
+            module: Option<PyObjectRef>,
+        ) -> Self {
+            Self {
+                name,
+                qualname,
+                type_params,
+                compute_value: value.clone(),
+                cached_value: crate::common::lock::PyMutex::new(Some(value)),
+                module: crate::common::lock::PyMutex::new(module),
+                is_lazy: false,
+            }
+        }
+
+        fn __getitem__(zelf: &Py<Self>, args: PyObjectRef, vm: &VirtualMachine) -> PyResult {
+            if zelf.type_params.as_slice().is_empty() {
+                return Err(vm.new_type_error("Only generic type aliases are subscriptable"));
+            }
+            let args_tuple = if let Ok(tuple) = args.try_to_ref::<PyTuple>(vm) {
+                tuple.to_owned()
+            } else {
+                PyTuple::new_ref(vec![args], &vm.ctx)
+            };
+            let origin: PyObjectRef = zelf.as_object().to_owned();
+            Ok(PyGenericAlias::new(origin, args_tuple, false, vm)?.into_pyobject(vm))
+        }
+
+        // Validate native type parameters before evaluating their defaults. Arbitrary
+        // objects with a __default__ attribute are not type parameters.
+        fn check_type_params(
+            type_params: &Py<PyTuple>,
+            vm: &VirtualMachine,
+        ) -> PyResult<PyTupleRef> {
+            if type_params.as_slice().is_empty() {
+                return Ok(vm.ctx.empty_tuple.clone());
+            }
+            let no_default = &vm.ctx.typing_no_default;
+            let mut default_seen = false;
+            for param in type_params {
+                let class = param.class();
+                if !class.is(super::TypeVar::class(&vm.ctx))
+                    && !class.is(super::ParamSpec::class(&vm.ctx))
+                    && !class.is(super::TypeVarTuple::class(&vm.ctx))
+                {
+                    let repr = param.repr(vm)?;
+                    let mut message = Wtf8Buf::from("Expected a type param, got ");
+                    message.push_wtf8(repr.as_wtf8());
+                    return Err(vm.new_type_error(message));
+                }
+                // These immutable native types supply the default descriptor. Let
+                // a lazy default's exception propagate without reclassifying it.
+                let dflt = param.get_attr("__default__", vm)?;
+                if dflt.is(no_default) {
+                    if default_seen {
+                        let repr = param.repr(vm)?;
+                        let mut message = Wtf8Buf::from("non-default type parameter '");
+                        message.push_wtf8(repr.as_wtf8());
+                        message.push_str("' follows default type parameter");
+                        return Err(vm.new_type_error(message));
+                    }
+                } else {
+                    default_seen = true;
+                }
+            }
+            Ok(type_params.to_owned())
+        }
+    }
+
+    #[pyclass(
+        with(Constructor, Representable, AsMapping, AsNumber, Iterable),
+        flags(IMMUTABLETYPE)
+    )]
+    impl Py<TypeAliasType> {
+        #[pygetset]
+        fn __value__(&self, vm: &VirtualMachine) -> PyResult {
+            let cached = self.cached_value.lock().clone();
+            if let Some(value) = cached {
+                return Ok(value);
+            }
+            // Call evaluator with format=1 (FORMAT_VALUE)
+            let value = self.compute_value.call((1i32,), vm)?;
+            *self.cached_value.lock() = Some(value.clone());
+            Ok(value)
+        }
+
+        #[pygetset]
+        fn __type_params__(&self) -> PyTupleRef {
+            self.type_params.clone()
+        }
+
+        #[pygetset]
+        fn __parameters__(&self, vm: &VirtualMachine) -> PyResult<PyObjectRef> {
+            // TypeVarTuples must be unpacked in __parameters__
+            unpack_typevartuples(&self.type_params, vm).map(|t| t.into())
+        }
+
+        #[pygetset]
+        fn __module__(&self, vm: &VirtualMachine) -> PyObjectRef {
+            let module = self.module.lock().clone();
+            if let Some(module) = module {
+                return module;
+            }
+            // Fall back to compute_value's __module__ (like PyFunction_GetModule)
+            if self.is_lazy
+                && let Ok(module) = self.compute_value.get_attr("__module__", vm)
+            {
+                return module;
+            }
+            vm.ctx.none()
+        }
+
+        #[pygetset(setter)]
+        fn set___module__(&self, value: PySetterValue) {
+            let _previous = core::mem::replace(&mut *self.module.lock(), value.into_option());
+        }
+
+        #[pymethod]
+        fn __reduce__(zelf: &Self, _vm: &VirtualMachine) -> PyObjectRef {
+            zelf.name.clone().into()
+        }
+
+        #[pymethod]
+        fn __typing_unpacked_tuple_args__(&self, vm: &VirtualMachine) -> PyObjectRef {
+            vm.ctx.none()
+        }
+
+        #[pygetset]
+        fn evaluate_value(&self, vm: &VirtualMachine) -> PyObjectRef {
+            if self.is_lazy {
+                return self.compute_value.clone();
+            }
+            const_evaluator_alloc(self.compute_value.clone(), vm)
+        }
+    }
+
+    impl Constructor for TypeAliasType {
+        type Args = TypeAliasArgs;
+
+        fn slot_new(cls: PyTypeRef, args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+            let args: Self::Args = args.bind_for(vm, "typealias")?;
+            // Empty tuple subclasses are normalized away, but their finalizers
+            // must not run before the alias object has been allocated.
+            let _original_type_params = match &args.type_params {
+                OptionalArg::Present(tp) => Some(tp.clone()),
+                OptionalArg::Missing => None,
+            };
+            Self::py_new(&cls, args, vm)
+                .and_then(|payload| payload.into_ref_with_type(vm, cls).map(Into::into))
+        }
+
+        fn py_new(_cls: &Py<PyType>, args: Self::Args, vm: &VirtualMachine) -> PyResult<Self> {
+            // Bind raw objects first, so call-shape errors precede conversion.
+            let TypeAliasArgs {
+                name,
+                value,
+                type_params,
+                qualname,
+            } = args;
+            let name = name.downcast::<crate::builtins::PyStr>().map_err(|obj| {
+                vm.new_type_error(format!(
+                    "typealias() argument 'name' must be str, not {}",
+                    obj.class().name()
+                ))
+            })?;
+
+            let checked_type_params = match &type_params {
+                OptionalArg::Present(tp) => {
+                    let tp = tp
+                        .clone()
+                        .downcast::<PyTuple>()
+                        .map_err(|_| vm.new_type_error("type_params must be a tuple"))?;
+                    Self::check_type_params(&tp, vm)?
+                }
+                OptionalArg::Missing => vm.ctx.empty_tuple.clone(),
+            };
+
+            let qualname = match qualname {
+                OptionalArg::Present(qualname) if !vm.is_none(&qualname) => qualname
+                    .downcast::<crate::builtins::PyStr>()
+                    .map_err(|_| vm.new_type_error("qualname must be a string"))?,
+                _ => name.clone(),
+            };
+
+            // Like CPython's caller(), use the function's cached module metadata,
+            // which can differ from the current globals' __name__ entry.
+            let function = vm
+                .current_frame()
+                .and_then(|frame| frame.iframe().func_obj().map(|obj| obj.to_owned()));
+            let module = function.and_then(|func| func.get_attr("__module__", vm).ok());
+
+            Ok(Self::new_eager(
+                name,
+                qualname,
+                checked_type_params,
+                value,
+                module,
+            ))
+        }
+    }
+
+    impl Representable for TypeAliasType {
+        fn repr_wtf8(zelf: &Py<Self>, _vm: &VirtualMachine) -> PyResult<Wtf8Buf> {
+            Ok(zelf.qualname.as_wtf8().to_owned())
+        }
+    }
+
+    impl AsMapping for TypeAliasType {
+        fn as_mapping() -> &'static PyMappingMethods {
+            static AS_MAPPING: LazyLock<PyMappingMethods> = LazyLock::new(|| PyMappingMethods {
+                subscript: atomic_func!(|mapping, needle, vm| {
+                    let zelf = TypeAliasType::mapping_downcast(mapping);
+                    TypeAliasType::__getitem__(zelf, needle.to_owned(), vm)
+                }),
+                ..PyMappingMethods::NOT_IMPLEMENTED
+            });
+            &AS_MAPPING
+        }
+    }
+
+    impl AsNumber for TypeAliasType {
+        fn as_number() -> &'static PyNumberMethods {
+            static AS_NUMBER: PyNumberMethods = PyNumberMethods {
+                or: Some(|a, b, vm| type_::or_(a.to_owned(), b.to_owned(), vm)),
+                ..PyNumberMethods::NOT_IMPLEMENTED
+            };
+            &AS_NUMBER
+        }
+    }
+
+    impl Iterable for TypeAliasType {
+        fn iter(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyResult {
+            // Import typing.Unpack and return iter((Unpack[self],))
+            let typing = vm.import("typing", 0)?;
+            let unpack = typing.get_attr("Unpack", vm)?;
+            let zelf_obj: PyObjectRef = zelf.into();
+            let unpacked = vm.call_method(&unpack, "__getitem__", (zelf_obj,))?;
+            let tuple = PyTuple::new_ref(vec![unpacked], &vm.ctx);
+            Ok(tuple.as_object().get_iter(vm)?.into())
+        }
+    }
+
+    /// Wrap TypeVarTuples in Unpack[], matching unpack_typevartuples()
+    pub(crate) fn unpack_typevartuples(
+        type_params: &Py<PyTuple>,
+        vm: &VirtualMachine,
+    ) -> PyResult<PyTupleRef> {
+        let has_tvt = type_params
+            .as_slice()
+            .iter()
+            .any(|p| p.downcastable::<crate::stdlib::typevar::TypeVarTuple>());
+        if !has_tvt {
+            return Ok(type_params.to_owned());
+        }
+        let typing = vm.import("typing", 0)?;
+        let unpack_cls = typing.get_attr("Unpack", vm)?;
+        let new_params: Vec<PyObjectRef> = type_params
+            .as_slice()
+            .iter()
+            .map(|p| {
+                if p.downcastable::<crate::stdlib::typevar::TypeVarTuple>() {
+                    vm.call_method(&unpack_cls, "__getitem__", (p.clone(),))
+                } else {
+                    Ok(p.clone())
+                }
+            })
+            .collect::<PyResult<_>>()?;
+        Ok(PyTuple::new_ref(new_params, &vm.ctx))
+    }
+
+    #[expect(clippy::unnecessary_wraps, reason = "Needs to comply with a signature")]
+    pub(crate) fn module_exec(
+        vm: &VirtualMachine,
+        module: &Py<crate::builtins::PyModule>,
+    ) -> PyResult<()> {
+        __module_exec(vm, module);
+
+        extend_module!(vm, module, {
+            "NoDefault" => vm.ctx.typing_no_default.clone(),
+            "Union" => vm.ctx.types.union_type.to_owned(),
+        });
+
+        Ok(())
+    }
+}

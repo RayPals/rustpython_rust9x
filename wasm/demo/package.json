@@ -1,0 +1,40 @@
+{
+    "name": "app",
+    "version": "1.0.0",
+    "description": "Bindings to the RustPython library for WebAssembly",
+    "main": "index.js",
+    "dependencies": {
+        "@codemirror/lang-python": "^6.2.1",
+        "@xterm/addon-fit": "^0.11.0",
+        "@xterm/xterm": "^6.0.0",
+        "codemirror": "^6.0.2",
+        "upgrade": "^1.1.0",
+        "xterm-readline": "^1.3.1"
+    },
+    "devDependencies": {
+        "@wasm-tool/wasm-pack-plugin": "^1.7.0",
+        "css-loader": "^7.1.5",
+        "html-webpack-plugin": "^5.6.8",
+        "mini-css-extract-plugin": "^2.10.2",
+        "serve": "^14.2.7",
+        "webpack": "^5.112.2",
+        "webpack-cli": "^7.3.1",
+        "webpack-dev-server": "^5.2.6"
+    },
+    "scripts": {
+        "dev": "webpack serve",
+        "build": "webpack",
+        "dist": "webpack --mode production",
+        "test": "webpack --mode production && cd ../tests && pytest -v"
+    },
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/RustPython/RustPython.git"
+    },
+    "author": "Ryan Liddle",
+    "license": "MIT",
+    "bugs": {
+        "url": "https://github.com/RustPython/RustPython/issues"
+    },
+    "homepage": "https://github.com/RustPython/RustPython#readme"
+}

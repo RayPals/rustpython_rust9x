@@ -1,0 +1,580 @@
+use core::ops::Range;
+
+use num_traits::{cast::ToPrimitive, sign::Signed};
+use rustpython_unicode::case;
+
+use crate::{
+    AsObject, Py, PyObject, PyObjectRef, PyResult, TryFromObject, VirtualMachine,
+    builtins::{PyInt, PyTuple},
+    convert::TryFromBorrowedObject,
+    function::{ArgIndex, PySsize},
+};
+
+pub(crate) fn checked_replace_len(
+    original: usize,
+    old: usize,
+    new: usize,
+    count: usize,
+) -> Option<usize> {
+    let result = if new >= old {
+        original.checked_add(count.checked_mul(new - old)?)?
+    } else {
+        original.checked_sub(count.checked_mul(old - new)?)?
+    };
+    isize::try_from(result).ok().map(|_| result)
+}
+
+pub(crate) fn checked_expandtabs_len(
+    original: usize,
+    chars: impl Iterator<Item = u32>,
+    tabsize: usize,
+) -> Option<usize> {
+    let mut result = original;
+    let mut column = 0;
+    for ch in chars {
+        if ch == u32::from(b'\t') {
+            let spaces = if tabsize == 0 {
+                0
+            } else {
+                tabsize - column % tabsize
+            };
+            result = checked_replace_len(result, 1, spaces, 1)?;
+            column += spaces;
+        } else if ch == u32::from(b'\r') || ch == u32::from(b'\n') {
+            column = 0;
+        } else {
+            column += 1;
+        }
+    }
+    Some(result)
+}
+
+#[derive(FromArgs)]
+pub struct SplitArgs<T: TryFromObject> {
+    #[pyarg(any, optional)]
+    sep: Option<T>,
+    #[pyarg(any, default = -1)]
+    maxsplit: PySsize,
+}
+
+#[derive(FromArgs)]
+pub struct SplitLinesArgs {
+    #[pyarg(any, default)]
+    pub keepends: bool,
+}
+
+#[derive(FromArgs)]
+pub struct ExpandTabsArgs {
+    #[pyarg(any, default = 8)]
+    tabsize: i32,
+}
+
+impl ExpandTabsArgs {
+    pub fn tabsize(&self) -> usize {
+        self.tabsize.to_usize().unwrap_or(0)
+    }
+}
+
+#[derive(FromArgs)]
+#[from_args(text_signature = "(prefix[, start[, end]], /)")]
+pub(crate) struct StartsEndsWithArgs {
+    #[pyarg(positional)]
+    affix: PyObjectRef,
+    #[pyarg(positional, default)]
+    start: Option<ArgIndex>,
+    #[pyarg(positional, default)]
+    end: Option<ArgIndex>,
+}
+
+#[derive(FromArgs)]
+#[from_args(text_signature = "(suffix[, start[, end]], /)")]
+pub(crate) struct EndsWithArgs {
+    #[pyarg(flatten)]
+    pub(crate) inner: StartsEndsWithArgs,
+}
+
+impl StartsEndsWithArgs {
+    pub(crate) fn parts(&self, len: usize) -> (&PyObject, Option<Range<usize>>) {
+        let range = if self.start.is_some() || self.end.is_some() {
+            Some(adjust_indices(
+                self.start.as_ref().map(AsRef::as_ref),
+                self.end.as_ref().map(AsRef::as_ref),
+                len,
+            ))
+        } else {
+            None
+        };
+        (&self.affix, range)
+    }
+
+    pub(crate) fn matches<'a, T, F>(
+        &'a self,
+        len: usize,
+        func_name: &str,
+        py_type_name: &str,
+        predicate: F,
+        vm: &VirtualMachine,
+    ) -> PyResult<bool>
+    where
+        T: TryFromBorrowedObject<'a>,
+        F: Fn(T, Option<Range<usize>>) -> bool,
+    {
+        let (affix, range) = self.parts(len);
+        // Validate each affix even when the requested range cannot match. A
+        // tuple is still short-circuited after its first successful match.
+        single_or_tuple_any(
+            affix,
+            &|item| Ok(predicate(item, range.clone())),
+            &|obj, in_tuple| {
+                let name = obj.class().slot_name();
+                if py_type_name == "str" {
+                    let name = &name[..name.floor_char_boundary(100)];
+                    Some(if in_tuple {
+                        format!("tuple for {func_name} must only contain str, not {name}")
+                    } else {
+                        format!("{func_name} first arg must be str or a tuple of str, not {name}")
+                    })
+                } else if in_tuple {
+                    None
+                } else {
+                    Some(format!(
+                        "{func_name} first arg must be bytes or a tuple of bytes, not {name}"
+                    ))
+                }
+            },
+            vm,
+        )
+    }
+}
+
+fn saturate_to_isize(py_int: &Py<PyInt>) -> isize {
+    let big = py_int.as_bigint();
+    big.to_isize().unwrap_or_else(|| {
+        if big.is_negative() {
+            isize::MIN
+        } else {
+            isize::MAX
+        }
+    })
+}
+
+// help get optional string indices
+pub(crate) fn adjust_indices(
+    start: Option<&Py<PyInt>>,
+    end: Option<&Py<PyInt>>,
+    len: usize,
+) -> Range<usize> {
+    let mut start = start.map_or(0, saturate_to_isize);
+    let mut end = end.map_or(len as isize, saturate_to_isize);
+    if end > len as isize {
+        end = len as isize;
+    } else if end < 0 {
+        end += len as isize;
+        if end < 0 {
+            end = 0;
+        }
+    }
+    if start < 0 {
+        start += len as isize;
+        if start < 0 {
+            start = 0;
+        }
+    }
+    start as usize..end as usize
+}
+
+pub(crate) trait StringRange {
+    fn is_normal(&self) -> bool;
+}
+
+impl StringRange for Range<usize> {
+    fn is_normal(&self) -> bool {
+        self.start <= self.end
+    }
+}
+
+pub(crate) trait AnyStrWrapper<S: AnyStr + ?Sized> {
+    fn as_ref(&self) -> Option<&S>;
+    fn is_empty(&self) -> bool;
+}
+
+pub(crate) trait AnyStrContainer<S>
+where
+    S: ?Sized,
+{
+    fn new() -> Self;
+    fn with_capacity(capacity: usize) -> Self;
+    /// `with_capacity`, reporting a capacity that cannot be allocated instead
+    /// of aborting the process on it.
+    fn try_with_capacity(capacity: usize) -> Option<Self>
+    where
+        Self: Sized;
+    fn push_str(&mut self, s: &S);
+}
+
+pub(crate) trait AnyChar: Copy {
+    fn bytes_len(self) -> usize;
+}
+
+pub(crate) trait AnyStr {
+    type Char: AnyChar;
+    type Container: AnyStrContainer<Self> + Extend<Self::Char>;
+
+    fn to_container(&self) -> Self::Container;
+    fn as_bytes(&self) -> &[u8];
+    fn elements(&self) -> impl Iterator<Item = Self::Char>;
+    fn get_bytes(&self, range: Range<usize>) -> &Self;
+    /// The characters in `range`, which for a `str` payload means walking to
+    /// both bounds -- the payload does not carry the string's character index.
+    /// `PyStr` therefore converts its own ranges and does not reach the search
+    /// helpers below through this; what remains are the byte strings, where a
+    /// character range is already a byte range.
+    fn get_chars(&self, range: Range<usize>) -> &Self;
+    fn bytes_len(&self) -> usize;
+    // NOTE: str::chars().count() consumes the O(n) time. But pystr::char_len does cache.
+    //       So using chars_len directly is too expensive and the below method shouldn't be implemented.
+    // fn chars_len(&self) -> usize;
+    fn is_empty(&self) -> bool;
+
+    fn py_add(&self, other: &Self) -> Self::Container {
+        let mut new = Self::Container::with_capacity(self.bytes_len() + other.bytes_len());
+        new.push_str(self);
+        new.push_str(other);
+        new
+    }
+
+    fn py_split<T, SP, SN, SW>(
+        &self,
+        args: SplitArgs<T>,
+        vm: &VirtualMachine,
+        full_obj: impl FnOnce() -> PyObjectRef,
+        split: SP,
+        splitn: SN,
+        split_whitespace: SW,
+    ) -> PyResult<Vec<PyObjectRef>>
+    where
+        T: TryFromObject + AnyStrWrapper<Self>,
+        SP: Fn(&Self, &Self, &VirtualMachine) -> Vec<PyObjectRef>,
+        SN: Fn(&Self, &Self, usize, &VirtualMachine) -> Vec<PyObjectRef>,
+        SW: Fn(&Self, isize, &VirtualMachine) -> Vec<PyObjectRef>,
+    {
+        if args.sep.as_ref().is_some_and(|sep| sep.is_empty()) {
+            return Err(vm.new_value_error("empty separator"));
+        }
+        let splits = if let Some(pattern) = args.sep {
+            let Some(pattern) = pattern.as_ref() else {
+                return Ok(vec![full_obj()]);
+            };
+            if args.maxsplit < 0 {
+                split(self, pattern, vm)
+            } else {
+                // Widen before adding: `isize::MAX + 1` overflows, and `sys.maxsize`
+                // is a legitimate maxsplit.
+                splitn(self, pattern, args.maxsplit as usize + 1, vm)
+            }
+        } else {
+            split_whitespace(self, args.maxsplit, vm)
+        };
+        Ok(splits)
+    }
+    fn py_split_whitespace<F>(&self, maxsplit: isize, convert: F) -> Vec<PyObjectRef>
+    where
+        F: Fn(&Self) -> PyObjectRef;
+    fn py_rsplit_whitespace<F>(&self, maxsplit: isize, convert: F) -> Vec<PyObjectRef>
+    where
+        F: Fn(&Self) -> PyObjectRef;
+
+    #[inline]
+    fn py_strip<'a, S, FC, FD>(
+        &'a self,
+        chars: Option<S>,
+        func_chars: FC,
+        func_default: FD,
+    ) -> &'a Self
+    where
+        S: AnyStrWrapper<Self>,
+        FC: Fn(&'a Self, &Self) -> &'a Self,
+        FD: Fn(&'a Self) -> &'a Self,
+    {
+        match chars {
+            Some(chars) => {
+                if let Some(chars) = chars.as_ref() {
+                    func_chars(self, chars)
+                } else {
+                    self
+                }
+            }
+            None => func_default(self),
+        }
+    }
+
+    #[inline]
+    fn py_find<F>(&self, needle: &Self, range: Range<usize>, find: F) -> Option<usize>
+    where
+        F: Fn(&Self, &Self) -> Option<usize>,
+    {
+        if range.is_normal() {
+            let start = range.start;
+            let index = find(self.get_chars(range), needle)?;
+            Some(start + index)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn py_count<F>(&self, needle: &Self, range: Range<usize>, count: F) -> usize
+    where
+        F: Fn(&Self, &Self) -> usize,
+    {
+        if range.is_normal() {
+            count(self.get_chars(range), needle)
+        } else {
+            0
+        }
+    }
+
+    fn py_pad(&self, left: usize, right: usize, fillchar: Self::Char) -> Option<Self::Container> {
+        let capacity = left
+            .checked_add(right)?
+            .checked_mul(fillchar.bytes_len())?
+            .checked_add(self.bytes_len())?;
+        let mut u = Self::Container::try_with_capacity(capacity)?;
+        u.extend(core::iter::repeat_n(fillchar, left));
+        u.push_str(self);
+        u.extend(core::iter::repeat_n(fillchar, right));
+        Some(u)
+    }
+
+    fn py_center(&self, width: usize, fillchar: Self::Char, len: usize) -> Option<Self::Container> {
+        let marg = width - len;
+        let left = marg / 2 + (marg & width & 1);
+        self.py_pad(left, marg - left, fillchar)
+    }
+
+    fn py_ljust(&self, width: usize, fillchar: Self::Char, len: usize) -> Option<Self::Container> {
+        self.py_pad(0, width - len, fillchar)
+    }
+
+    fn py_rjust(&self, width: usize, fillchar: Self::Char, len: usize) -> Option<Self::Container> {
+        self.py_pad(width - len, 0, fillchar)
+    }
+
+    fn py_partition<'a, F, S>(
+        &'a self,
+        sub: &Self,
+        split: F,
+        vm: &VirtualMachine,
+    ) -> PyResult<(Self::Container, bool, Self::Container)>
+    where
+        F: Fn() -> S,
+        S: core::iter::Iterator<Item = &'a Self>,
+    {
+        if sub.is_empty() {
+            return Err(vm.new_value_error("empty separator"));
+        }
+
+        let mut sp = split();
+        let front = sp.next().unwrap().to_container();
+        let (has_mid, back) = if let Some(back) = sp.next() {
+            (true, back.to_container())
+        } else {
+            (false, Self::Container::new())
+        };
+        Ok((front, has_mid, back))
+    }
+
+    fn py_removeprefix<FC>(&self, prefix: &Self, prefix_len: usize, is_prefix: FC) -> &Self
+    where
+        FC: Fn(&Self, &Self) -> bool,
+    {
+        //if self.py_starts_with(prefix) {
+        if is_prefix(self, prefix) {
+            self.get_bytes(prefix_len..self.bytes_len())
+        } else {
+            self
+        }
+    }
+
+    fn py_removesuffix<FC>(&self, suffix: &Self, suffix_len: usize, is_suffix: FC) -> &Self
+    where
+        FC: Fn(&Self, &Self) -> bool,
+    {
+        if is_suffix(self, suffix) {
+            self.get_bytes(0..self.bytes_len() - suffix_len)
+        } else {
+            self
+        }
+    }
+
+    // TODO: remove this function from anystr.
+    // See https://github.com/RustPython/RustPython/pull/4709/files#r1141013993
+    fn py_bytes_splitlines<FW, W>(&self, options: SplitLinesArgs, into_wrapper: FW) -> Vec<W>
+    where
+        FW: Fn(&Self) -> W,
+    {
+        let keep = options.keepends as usize;
+        let mut elements = Vec::new();
+        let mut last_i = 0;
+        let mut enumerated = self.as_bytes().iter().enumerate().peekable();
+        while let Some((i, ch)) = enumerated.next() {
+            let (end_len, i_diff) = match *ch {
+                b'\n' => (keep, 1),
+                b'\r' => {
+                    let is_rn = enumerated.next_if(|(_, ch)| **ch == b'\n').is_some();
+                    if is_rn { (keep + keep, 2) } else { (keep, 1) }
+                }
+                _ => continue,
+            };
+            let range = last_i..i + end_len;
+            last_i = i + i_diff;
+            elements.push(into_wrapper(self.get_bytes(range)));
+        }
+        if last_i != self.bytes_len() {
+            elements.push(into_wrapper(self.get_bytes(last_i..self.bytes_len())));
+        }
+        elements
+    }
+
+    fn py_zfill(&self, width: isize) -> Option<Vec<u8>> {
+        let width = width.to_usize().unwrap_or(0);
+        let char_len = self.elements().count();
+        let width = self
+            .bytes_len()
+            .saturating_add(width.saturating_sub(char_len));
+        rustpython_common::str::zfill(self.as_bytes(), width)
+    }
+
+    // _Py_bytes_islower
+    fn py_islower(&self) -> bool {
+        let mut lower = false;
+        for byte in self
+            .as_bytes()
+            .iter()
+            .copied()
+            .filter(u8::is_ascii_alphabetic)
+        {
+            if byte.is_ascii_uppercase() {
+                return false;
+            }
+            lower = true;
+        }
+
+        lower
+    }
+
+    // Py_bytes_isupper
+    fn py_isupper(&self) -> bool {
+        let mut upper = false;
+        for byte in self
+            .as_bytes()
+            .iter()
+            .copied()
+            .filter(u8::is_ascii_alphabetic)
+        {
+            if byte.is_ascii_lowercase() {
+                return false;
+            }
+            upper = true;
+        }
+
+        upper
+    }
+
+    // Unified form of CPython functions:
+    //  unicode_isupper_impl
+    //  unicode_islower_impl
+    fn is_cased(&self, valid: fn(char) -> bool, invalid: fn(char) -> bool) -> bool {
+        let mut all_cased = false;
+        for c in self
+            .as_bytes()
+            .utf8_chunks()
+            .flat_map(|c| c.valid().chars())
+        {
+            if invalid(c) || case::is_titlecase(c) {
+                return false;
+            }
+
+            if !all_cased && valid(c) {
+                all_cased = true;
+            }
+        }
+
+        all_cased
+    }
+}
+
+/// Tests that the predicate is True on a single value, or if the value is a tuple a tuple, then
+/// test that any of the values contained within the tuples satisfies the predicate. Type parameter
+/// T specifies the type that is expected, if the input value is not of that type or a tuple of
+/// values of that type, then a TypeError is raised.
+pub(crate) fn single_or_tuple_any<'a, T, F, M>(
+    obj: &'a PyObject,
+    predicate: &F,
+    message: &M,
+    vm: &VirtualMachine,
+) -> PyResult<bool>
+where
+    T: TryFromBorrowedObject<'a>,
+    F: Fn(T) -> PyResult<bool>,
+    M: Fn(&PyObject, bool) -> Option<String>,
+{
+    let convert = |item: &'a PyObject, in_tuple| {
+        item.try_to_value::<T>(vm).map_err(|exc| {
+            if exc.fast_isinstance(vm.ctx.exceptions.type_error)
+                && let Some(message) = message(item, in_tuple)
+            {
+                vm.new_type_error(message)
+            } else {
+                exc
+            }
+        })
+    };
+    // _Py_bytes_tailmatch: a tuple is taken apart before anything is converted, and
+    // each item is converted on its own terms, so a tuple of tuples is not an affix.
+    if let Some(tuple) = obj.downcast_ref::<PyTuple>() {
+        for item in tuple {
+            if (predicate)(convert(item, true)?)? {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+
+    // Only the argument simply being the wrong kind of object is reported as such;
+    // whatever the conversion itself raised belongs to the caller.
+    let single = convert(obj, false)?;
+    (predicate)(single)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{checked_expandtabs_len, checked_replace_len};
+
+    #[test]
+    fn replacement_length_checks_signed_and_unsigned_overflow() {
+        let max = isize::MAX as usize;
+        assert_eq!(checked_replace_len(4, 0, 1, 5), Some(9));
+        assert_eq!(checked_replace_len(6, 1, 0, 4), Some(2));
+        assert_eq!(checked_replace_len(max, 0, 1, 0), Some(max));
+        assert_eq!(checked_replace_len(max, 0, 1, 1), None);
+        assert_eq!(checked_replace_len(1, 0, 2, usize::MAX), None);
+    }
+
+    #[test]
+    fn expanded_tabs_check_the_complete_output_before_allocating() {
+        let max = isize::MAX as usize;
+        assert_eq!(
+            checked_expandtabs_len(1, "\t".chars().map(u32::from), max),
+            Some(max)
+        );
+        assert_eq!(
+            checked_expandtabs_len(3, "\t\n\t".chars().map(u32::from), max),
+            None
+        );
+        assert_eq!(
+            checked_expandtabs_len(3, "a\tb".chars().map(u32::from), 0),
+            Some(2)
+        );
+    }
+}

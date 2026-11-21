@@ -1,0 +1,1087 @@
+// spell-checker:disable
+
+pub(crate) use decl::module_def;
+
+use crate::vm::{
+    PyObject, PyObjectRef, PyResult, TryFromObject, VirtualMachine, builtins::PyListRef,
+    stdlib::_io::Fildes,
+};
+use rustpython_host_env::select::{self as host_select, FdSet, RawFd, platform::FD_SETSIZE};
+use std::io;
+
+#[derive(Traverse)]
+struct Selectable {
+    obj: PyObjectRef,
+    #[pytraverse(skip)]
+    fno: RawFd,
+}
+
+impl TryFromObject for Selectable {
+    fn try_from_object(vm: &VirtualMachine, obj: PyObjectRef) -> PyResult<Self> {
+        let Fildes(fd) = Fildes::try_from_object(vm, obj.clone())?;
+        let fno = fd as RawFd;
+        Ok(Self { obj, fno })
+    }
+}
+
+#[pymodule(name = "select")]
+mod decl {
+    use super::*;
+    use crate::vm::{
+        AsObject, Py, PyObjectRef, PyResult, VirtualMachine,
+        builtins::{PyModule, PyTypeRef},
+        convert::ToPyException,
+        stdlib::time::pytime::{self, Round},
+    };
+
+    use core::time::Duration;
+    use std::time::Instant;
+
+    // Keep the signed result until each API has applied its negative-timeout
+    // policy. In particular, overflow must not become an infinite wait.
+    fn timeout_nanoseconds(
+        object: Option<&PyObject>,
+        milliseconds: bool,
+        vm: &VirtualMachine,
+    ) -> PyResult<Option<i64>> {
+        let Some(object) = object.filter(|object| !vm.is_none(object)) else {
+            return Ok(None);
+        };
+        let convert = if milliseconds {
+            pytime::from_milliseconds_object
+        } else {
+            pytime::from_seconds_object
+        };
+        convert(object, Round::Up, vm).map(Some).map_err(|err| {
+            if err.fast_isinstance(vm.ctx.exceptions.type_error) {
+                vm.new_type_error(format!(
+                    "timeout must be a real number or None, not {}",
+                    object.class().name()
+                ))
+            } else {
+                err
+            }
+        })
+    }
+
+    fn timeout_duration(timeout: Option<i64>) -> Option<Duration> {
+        timeout
+            .filter(|&ns| ns >= 0)
+            .map(|ns| Duration::from_nanos(ns as u64))
+    }
+
+    fn timeout_deadline(
+        timeout: Option<Duration>,
+        vm: &VirtualMachine,
+    ) -> PyResult<Option<Instant>> {
+        timeout
+            .map(|duration| {
+                Instant::now()
+                    .checked_add(duration)
+                    .ok_or_else(|| vm.new_overflow_error("timeout is too large"))
+            })
+            .transpose()
+    }
+
+    #[expect(clippy::unnecessary_wraps, reason = "Needs to comply with a signature")]
+    pub(crate) fn module_exec(vm: &VirtualMachine, module: &Py<PyModule>) -> PyResult<()> {
+        #[cfg(windows)]
+        rustpython_host_env::windows::init_winsock();
+
+        #[cfg(unix)]
+        {
+            use crate::vm::class::PyClassImpl;
+            let _ = poll::PyPoll::make_static_type();
+        }
+
+        __module_exec(vm, module);
+        Ok(())
+    }
+
+    #[pyattr]
+    fn error(vm: &VirtualMachine) -> PyTypeRef {
+        vm.ctx.exceptions.os_error.to_owned()
+    }
+
+    #[derive(FromArgs)]
+    struct SelectArgs {
+        #[pyarg(positional)]
+        rlist: PyObjectRef,
+        #[pyarg(positional)]
+        wlist: PyObjectRef,
+        #[pyarg(positional)]
+        xlist: PyObjectRef,
+        #[pyarg(positional, optional)]
+        timeout: Option<PyObjectRef>,
+    }
+
+    #[pyfunction]
+    fn select(
+        args: SelectArgs,
+        vm: &VirtualMachine,
+    ) -> PyResult<(PyListRef, PyListRef, PyListRef)> {
+        let SelectArgs {
+            rlist,
+            wlist,
+            xlist,
+            timeout,
+        } = args;
+        let timeout = timeout_nanoseconds(timeout.as_deref(), false, vm)?;
+        if let Some(ns) = timeout {
+            host_select::timeval_from_microseconds(Round::Up.divide(ns, 1000)).ok_or_else(
+                || vm.new_overflow_error("timestamp out of range for platform time_t"),
+            )?;
+            if ns < 0 {
+                return Err(vm.new_value_error("timeout must be non-negative"));
+            }
+        }
+        let mut timeout = timeout_duration(timeout);
+        let timeval = |duration| {
+            host_select::duration_to_timeval_ceiling(duration)
+                .ok_or_else(|| vm.new_overflow_error("timestamp out of range for platform time_t"))
+        };
+
+        let max_fds: usize = cfg_select! {
+            windows => FD_SETSIZE as usize,
+            _ => FD_SETSIZE,
+        };
+
+        let seq2set = |list: &PyObject| -> PyResult<Vec<Selectable>> {
+            // The limit is answered while the sequence is walked rather than
+            // from the length of the result. fileno() runs Python and can
+            // append to the very list being walked, and a walk that re-reads
+            // the list each step -- which is what `seq2set` does -- then never
+            // reaches a length to check.
+            let seen = core::cell::Cell::new(0usize);
+            let v: Vec<Selectable> = vm.extract_elements_with(list, |obj| {
+                let selectable = Selectable::try_from_object(vm, obj)?;
+                #[cfg(unix)]
+                if selectable.fno as usize >= FD_SETSIZE {
+                    return Err(vm.new_value_error("filedescriptor out of range in select()"));
+                }
+                seen.set(seen.get() + 1);
+                if seen.get() > max_fds {
+                    return Err(vm.new_value_error("too many file descriptors in select()"));
+                }
+                Ok(selectable)
+            })?;
+
+            Ok(v)
+        };
+
+        let rlist = seq2set(&rlist)?;
+        let wlist = seq2set(&wlist)?;
+        let xlist = seq2set(&xlist)?;
+
+        let nfds = cfg_select! {
+            windows => 0, // value is ignored on windows
+
+            _ => rlist
+                .iter()
+                .chain(&wlist)
+                .chain(&xlist)
+                .map(|fd| fd.fno)
+                .max()
+                .map_or(0, |n| n + 1) as _,
+        };
+
+        let fill = |list: &[Selectable]| {
+            let mut fds = FdSet::new();
+            for fd in list {
+                fds.insert(fd.fno);
+            }
+            fds
+        };
+
+        let set2list = |list: Vec<Selectable>, mut set: FdSet| {
+            vm.ctx.new_list(
+                list.into_iter()
+                    .filter(|fd| set.contains(fd.fno))
+                    .map(|fd| fd.obj)
+                    .collect(),
+            )
+        };
+
+        let deadline = timeout_deadline(timeout, vm)?;
+        loop {
+            // `select(2)` updates the fd sets in place. Rebuild them on every
+            // attempt, including EINTR retries; otherwise an interrupted call
+            // can leave empty sets and a NULL timeout, which blocks forever.
+            let mut r = fill(&rlist);
+            let mut w = fill(&wlist);
+            let mut x = fill(&xlist);
+
+            let mut tv = timeout.map(timeval).transpose()?;
+            let res =
+                vm.allow_threads(|| host_select::select(nfds, &mut r, &mut w, &mut x, tv.as_mut()));
+
+            match res {
+                Ok(_) => {
+                    return Ok((set2list(rlist, r), set2list(wlist, w), set2list(xlist, x)));
+                }
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) => return Err(err.to_pyexception(vm)),
+            }
+
+            vm.check_signals()?;
+
+            if let Some(deadline) = deadline {
+                timeout = deadline.checked_duration_since(Instant::now());
+                if timeout.is_none() {
+                    return Ok((
+                        vm.ctx.new_list(Vec::new()),
+                        vm.ctx.new_list(Vec::new()),
+                        vm.ctx.new_list(Vec::new()),
+                    ));
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[pyfunction]
+    fn poll() -> poll::PyPoll {
+        poll::PyPoll::default()
+    }
+
+    #[cfg(unix)]
+    #[pyattr]
+    use host_select::{
+        PIPE_BUF, POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT, POLLPRI, POLLRDBAND, POLLRDNORM,
+        POLLWRBAND, POLLWRNORM,
+    };
+
+    #[cfg(unix)]
+    pub(super) mod poll {
+        use super::*;
+        use crate::vm::{
+            PyPayload,
+            common::lock::PyMutex,
+            convert::{IntoPyException, ToPyObject},
+            function::OptionalArg,
+            stdlib::_io::Fildes,
+        };
+        use core::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Instant;
+
+        #[pyclass(module = "select", name = "poll")]
+        #[derive(Default, Debug, PyPayload)]
+        pub(crate) struct PyPoll {
+            // keep sorted
+            fds: PyMutex<Vec<host_select::PollFd>>,
+            poll_running: AtomicBool,
+        }
+
+        #[derive(FromArgs)]
+        struct PollRegisterArgs {
+            #[pyarg(positional)]
+            fd: PyObjectRef,
+            #[pyarg(positional, optional)]
+            eventmask: OptionalArg<PyObjectRef>,
+        }
+
+        #[derive(FromArgs)]
+        struct PollModifyArgs {
+            #[pyarg(positional)]
+            fd: PyObjectRef,
+            #[pyarg(positional)]
+            eventmask: PyObjectRef,
+        }
+
+        const DEFAULT_EVENTS: i16 =
+            host_select::POLLIN | host_select::POLLPRI | host_select::POLLOUT;
+
+        #[pyclass(flags(DISALLOW_INSTANTIATION))]
+        impl PyPoll {
+            #[pymethod]
+            fn register(
+                zelf: &Py<Self>,
+                args: PollRegisterArgs,
+                vm: &VirtualMachine,
+            ) -> PyResult<()> {
+                let Fildes(fd) = Fildes::try_from_object(vm, args.fd.clone())?;
+                let mask = match args.eventmask.as_ref() {
+                    OptionalArg::Present(mask) => u16::try_from_object(vm, mask.clone())? as i16,
+                    OptionalArg::Missing => DEFAULT_EVENTS,
+                };
+                host_select::insert_poll_fd(&mut zelf.fds.lock(), fd, mask);
+                Ok(())
+            }
+
+            #[pymethod]
+            fn modify(zelf: &Py<Self>, args: PollModifyArgs, vm: &VirtualMachine) -> PyResult<()> {
+                let Fildes(fd) = Fildes::try_from_object(vm, args.fd.clone())?;
+                #[expect(
+                    clippy::redundant_clone,
+                    reason = "Keep raw argument alive through conversion"
+                )]
+                let eventmask = u16::try_from_object(vm, args.eventmask.clone())? as i16;
+                let mut fds = zelf.fds.lock();
+                // Unlike unregister(), modify() reports an unregistered fd as ENOENT.
+                let pfd = host_select::get_poll_fd_mut(&mut fds, fd).ok_or_else(|| {
+                    io::Error::from_raw_os_error(libc::ENOENT).into_pyexception(vm)
+                })?;
+                pfd.events = eventmask;
+                Ok(())
+            }
+
+            #[pymethod]
+            fn unregister(
+                zelf: &Py<Self>,
+                Fildes(fd): Fildes,
+                vm: &VirtualMachine,
+            ) -> PyResult<()> {
+                let removed = host_select::remove_poll_fd(&mut zelf.fds.lock(), fd);
+                removed
+                    .map(drop)
+                    .ok_or_else(|| vm.new_key_error(vm.ctx.new_int(fd).into()))
+            }
+
+            #[pymethod]
+            fn poll(
+                zelf: &Py<Self>,
+                timeout: OptionalArg<PyObjectRef>,
+                vm: &VirtualMachine,
+            ) -> PyResult<Vec<PyObjectRef>> {
+                let timeout = timeout_nanoseconds(
+                    timeout.as_ref().into_option().map(|obj| &**obj),
+                    true,
+                    vm,
+                )?;
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                if let Some(ns) = timeout {
+                    i32::try_from(Round::Up.divide(ns, 1_000_000))
+                        .map_err(|_| vm.new_overflow_error("timeout is too large"))?;
+                }
+                let mut poll_timeout = host_select::PollTimeout::from_nanoseconds(timeout)
+                    .ok_or_else(|| vm.new_overflow_error("timeout is too large"))?;
+                let timeout = timeout_duration(timeout);
+                let native_timeout = |timeout| {
+                    host_select::PollTimeout::from_duration(timeout)
+                        .ok_or_else(|| vm.new_overflow_error("timeout is too large"))
+                };
+                let deadline = timeout_deadline(timeout, vm)?;
+                if zelf.poll_running.swap(true, Ordering::SeqCst) {
+                    return Err(vm.new_runtime_error("concurrent poll() invocation"));
+                }
+                struct ClearRunning<'a>(&'a AtomicBool);
+                impl Drop for ClearRunning<'_> {
+                    fn drop(&mut self) {
+                        self.0.store(false, Ordering::Release);
+                    }
+                }
+                let _running = ClearRunning(&zelf.poll_running);
+
+                // Poll a copy: the wait releases the GIL-equivalent and runs
+                // signal handlers, which can register or unregister on the same
+                // object, and a held lock would deadlock them.
+                let mut fds = zelf.fds.lock().clone();
+                loop {
+                    match vm.allow_threads(|| {
+                        host_select::poll_fds_with_timeout(&mut fds, &poll_timeout)
+                    }) {
+                        Ok(_) => break,
+                        Err(err) if err.raw_os_error() == Some(host_select::EINTR) => {
+                            vm.check_signals()?
+                        }
+                        Err(err) => return Err(err.into_pyexception(vm)),
+                    }
+                    if let Some(d) = deadline {
+                        if let Some(remaining) = d.checked_duration_since(Instant::now()) {
+                            poll_timeout = native_timeout(Some(remaining))?;
+                        } else {
+                            return Ok(Vec::new());
+                        }
+                    }
+                }
+                Ok(fds
+                    .iter()
+                    .filter(|pfd| pfd.revents != 0)
+                    .map(|pfd| (pfd.fd, pfd.revents as u16).to_pyobject(vm))
+                    .collect())
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "redox"))]
+    #[pyattr(once)]
+    fn epoll(_vm: &VirtualMachine) -> PyTypeRef {
+        use crate::vm::class::PyClassImpl;
+        epoll::PyEpoll::make_static_type()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "redox"))]
+    #[pyattr]
+    use host_select::{
+        EPOLL_CLOEXEC, EPOLLERR, EPOLLEXCLUSIVE, EPOLLHUP, EPOLLIN, EPOLLMSG, EPOLLONESHOT,
+        EPOLLOUT, EPOLLPRI, EPOLLRDBAND, EPOLLRDHUP, EPOLLRDNORM, EPOLLWAKEUP, EPOLLWRBAND,
+        EPOLLWRNORM,
+    };
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "redox"))]
+    #[pyattr]
+    const EPOLLET: u32 = host_select::EPOLLET as u32;
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "redox"))]
+    pub(super) mod epoll {
+        use super::*;
+        use crate::vm::{
+            Py, PyPayload, PyRef,
+            builtins::PyType,
+            common::lock::{PyRwLock, PyRwLockReadGuard},
+            convert::{IntoPyException, ToPyObject},
+            function::OptionalArg,
+            stdlib::_io::Fildes,
+            types::Constructor,
+        };
+        use core::ops::Deref;
+        use host_select::epoll::EpollFd;
+        use std::os::fd::AsRawFd;
+        use std::time::Instant;
+
+        #[pyclass(module = "select", name = "epoll")]
+        #[derive(Debug, rustpython_vm::PyPayload)]
+        pub(crate) struct PyEpoll {
+            epoll_fd: PyRwLock<Option<EpollFd>>,
+        }
+
+        #[derive(FromArgs)]
+        pub(crate) struct EpollNewArgs {
+            #[pyarg(any, default = -1)]
+            sizehint: i32,
+            #[pyarg(any, default)]
+            flags: i32,
+        }
+
+        impl Constructor for PyEpoll {
+            type Args = EpollNewArgs;
+
+            fn py_new(_cls: &Py<PyType>, args: Self::Args, vm: &VirtualMachine) -> PyResult<Self> {
+                if let ..=-2 | 0 = args.sizehint {
+                    return Err(vm.new_value_error("negative sizehint"));
+                }
+                if !matches!(args.flags, 0 | host_select::EPOLL_CLOEXEC) {
+                    return Err(vm.new_os_error("invalid flags"));
+                }
+                Self::new().map_err(|e| e.into_pyexception(vm))
+            }
+        }
+
+        #[derive(FromArgs)]
+        struct EpollUnregisterArgs {
+            #[pyarg(any)]
+            fd: PyObjectRef,
+        }
+
+        #[derive(FromArgs)]
+        struct EpollRegisterArgs {
+            #[pyarg(any)]
+            fd: PyObjectRef,
+            #[pyarg(
+                any,
+                optional,
+                py_default = "select.EPOLLIN | select.EPOLLPRI | select.EPOLLOUT"
+            )]
+            eventmask: OptionalArg<PyObjectRef>,
+        }
+
+        #[derive(FromArgs)]
+        struct EpollModifyArgs {
+            #[pyarg(any)]
+            fd: PyObjectRef,
+            #[pyarg(any)]
+            eventmask: PyObjectRef,
+        }
+
+        fn epoll_eventmask(obj: PyObjectRef, vm: &VirtualMachine) -> PyResult<u32> {
+            use crate::vm::function::ArgIndex;
+
+            (|| {
+                let value = ArgIndex::try_from_object(vm, obj.clone())?;
+                Ok(value.as_unsigned_bitfield::<32>(vm)? as u32)
+            })()
+        }
+
+        #[derive(FromArgs)]
+        struct EpollPollArgs {
+            #[pyarg(any, default, py_default = "None")]
+            timeout: Option<PyObjectRef>,
+            #[pyarg(any, default, py_default = "-1")]
+            maxevents: OptionalArg<PyObjectRef>,
+        }
+
+        #[derive(FromArgs)]
+        #[allow(dead_code)]
+        struct EpollExitArgs {
+            #[pyarg(positional, default = None)]
+            exc_type: Option<PyObjectRef>,
+            #[pyarg(positional, default = None)]
+            exc_value: Option<PyObjectRef>,
+            #[pyarg(positional, default = None)]
+            exc_tb: Option<PyObjectRef>,
+        }
+
+        #[pyclass(with(Constructor))]
+        impl PyEpoll {
+            fn new() -> std::io::Result<Self> {
+                let epoll_fd = host_select::epoll::create()?;
+                let epoll_fd = Some(epoll_fd).into();
+                Ok(Self { epoll_fd })
+            }
+
+            #[pymethod]
+            fn close(zelf: &Py<Self>) -> std::io::Result<()> {
+                let fd = zelf.epoll_fd.write().take();
+                if let Some(fd) = fd {
+                    host_select::epoll::close(fd)?;
+                }
+                Ok(())
+            }
+
+            #[pygetset]
+            fn closed(zelf: &Py<Self>) -> bool {
+                zelf.epoll_fd.read().is_none()
+            }
+
+            fn get_epoll(
+                &self,
+                vm: &VirtualMachine,
+            ) -> PyResult<impl Deref<Target = EpollFd> + '_> {
+                PyRwLockReadGuard::try_map(self.epoll_fd.read(), |x| x.as_ref())
+                    .map_err(|_| vm.new_value_error("I/O operation on closed epoll object"))
+            }
+
+            #[pymethod]
+            fn fileno(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<i32> {
+                zelf.get_epoll(vm).map(|epoll_fd| epoll_fd.as_raw())
+            }
+
+            #[pyclassmethod]
+            fn fromfd(cls: PyTypeRef, fd: i32, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
+                if fd == -1 {
+                    return Err(std::io::Error::from_raw_os_error(libc::EBADF).into_pyexception(vm));
+                }
+                let epoll_fd = Some(EpollFd::from_raw(fd)).into();
+                Self { epoll_fd }.into_ref_with_type(vm, cls)
+            }
+
+            #[pymethod]
+            fn register(
+                zelf: &Py<Self>,
+                args: EpollRegisterArgs,
+                vm: &VirtualMachine,
+            ) -> PyResult<()> {
+                let fd = Fildes::try_from_object(vm, args.fd.clone())?;
+                let events = match args.eventmask.as_ref() {
+                    OptionalArg::Present(mask) => epoll_eventmask(mask.clone(), vm)?,
+                    OptionalArg::Missing => (host_select::epoll::EventFlags::IN
+                        | host_select::epoll::EventFlags::PRI
+                        | host_select::epoll::EventFlags::OUT)
+                        .bits(),
+                };
+                let epoll_fd = &*zelf.get_epoll(vm)?;
+                host_select::epoll::add(epoll_fd, fd.as_raw_fd(), fd.as_raw_fd() as u64, events)
+                    .map_err(|e| e.into_pyexception(vm))
+            }
+
+            #[pymethod]
+            fn modify(zelf: &Py<Self>, args: EpollModifyArgs, vm: &VirtualMachine) -> PyResult<()> {
+                // Bind the full call before fileno(), __index__(), or warning hooks run.
+                let fd = Fildes::try_from_object(vm, args.fd.clone())?;
+                #[expect(
+                    clippy::redundant_clone,
+                    reason = "Keep raw argument alive through conversion and syscall"
+                )]
+                let eventmask = epoll_eventmask(args.eventmask.clone(), vm)?;
+                let epoll_fd = &*zelf.get_epoll(vm)?;
+                host_select::epoll::modify(
+                    epoll_fd,
+                    fd.as_raw_fd(),
+                    fd.as_raw_fd() as u64,
+                    eventmask,
+                )
+                .map_err(|e| e.into_pyexception(vm))
+            }
+
+            #[pymethod]
+            fn unregister(
+                zelf: &Py<Self>,
+                args: EpollUnregisterArgs,
+                vm: &VirtualMachine,
+            ) -> PyResult<()> {
+                // Validate the argument shape before fileno() can run Python code.
+                #[expect(
+                    clippy::redundant_clone,
+                    reason = "Keep descriptor object alive through the syscall"
+                )]
+                let fd = Fildes::try_from_object(vm, args.fd.clone())?;
+                let epoll_fd = &*zelf.get_epoll(vm)?;
+                host_select::epoll::delete(epoll_fd, fd.as_raw_fd())
+                    .map_err(|e| e.into_pyexception(vm))
+            }
+
+            #[pymethod]
+            fn poll(
+                zelf: &Py<Self>,
+                args: EpollPollArgs,
+                vm: &VirtualMachine,
+            ) -> PyResult<PyListRef> {
+                let maxevents = match args.maxevents.as_ref() {
+                    OptionalArg::Present(value) => i32::try_from_object(vm, value.clone())?,
+                    OptionalArg::Missing => -1,
+                };
+                // The closed check precedes timeout callbacks, but the read lock
+                // must not be held while a callback can close this object.
+                drop(zelf.get_epoll(vm)?);
+                let nanoseconds = timeout_nanoseconds(args.timeout.as_deref(), false, vm)?;
+                if let Some(ns) = nanoseconds {
+                    i32::try_from(Round::Ceiling.divide(ns, 1_000_000))
+                        .map_err(|_| vm.new_overflow_error("timeout is too large"))?;
+                }
+                // Negative sub-millisecond values round to zero for epoll_wait.
+                let timeout = timeout_duration(nanoseconds.map(|ns| {
+                    if ns < 0 && Round::Ceiling.divide(ns, 1_000_000) == 0 {
+                        0
+                    } else {
+                        ns
+                    }
+                }));
+
+                // epoll_wait takes signed milliseconds; round upward and reject
+                // overflow, matching CPython's epoll.poll conversion.
+                let to_millis = |timeout| {
+                    host_select::duration_as_millis_ceiling(timeout)
+                        .ok_or_else(|| vm.new_overflow_error("timeout is too large"))
+                };
+                let mut poll_timeout = timeout.map(to_millis).transpose()?.unwrap_or(-1);
+
+                let deadline = timeout_deadline(timeout_duration(nanoseconds), vm)?;
+                let maxevents = match maxevents {
+                    ..=-2 | 0 => {
+                        return Err(vm.new_value_error(format!(
+                            "maxevents must be greater than 0, got {maxevents}"
+                        )));
+                    }
+                    -1 => host_select::FD_SETSIZE - 1,
+                    _ => maxevents as usize,
+                };
+
+                let mut events = Vec::<host_select::epoll::Event>::with_capacity(maxevents);
+
+                let epoll = &*zelf.get_epoll(vm)?;
+
+                loop {
+                    match vm.allow_threads(|| {
+                        host_select::epoll::wait(epoll, &mut events, poll_timeout)
+                    }) {
+                        Ok(_) => break,
+                        Err(host_select::epoll::WaitError::Interrupted) => vm.check_signals()?,
+                        Err(host_select::epoll::WaitError::Io(e)) => {
+                            return Err(e.into_pyexception(vm));
+                        }
+                    }
+                    if let Some(deadline) = deadline {
+                        if let Some(new_timeout) = deadline.checked_duration_since(Instant::now()) {
+                            poll_timeout = to_millis(new_timeout)?;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+
+                let ret = events
+                    .iter()
+                    .map(|ev| (ev.data() as i32, ev.flags()).to_pyobject(vm))
+                    .collect();
+
+                Ok(vm.ctx.new_list(ret))
+            }
+
+            #[pymethod]
+            fn __enter__(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
+                zelf.get_epoll(vm)?;
+                Ok(zelf)
+            }
+
+            #[pymethod]
+            fn __exit__(zelf: &Py<Self>, _args: EpollExitArgs) -> std::io::Result<()> {
+                Self::close(zelf)
+            }
+        }
+    }
+
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    ))]
+    #[pyattr(name = "kqueue", once)]
+    fn kqueue_type(_vm: &VirtualMachine) -> PyTypeRef {
+        use crate::vm::class::PyClassImpl;
+        kqueue::PyKqueue::make_static_type()
+    }
+
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    ))]
+    #[pyattr(name = "kevent", once)]
+    fn kevent_type(_vm: &VirtualMachine) -> PyTypeRef {
+        use crate::vm::class::PyClassImpl;
+        kqueue::PyKevent::make_static_type()
+    }
+
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    ))]
+    #[pyattr]
+    use host_select::kqueue::{
+        EV_ADD as KQ_EV_ADD, EV_CLEAR as KQ_EV_CLEAR, EV_DELETE as KQ_EV_DELETE,
+        EV_DISABLE as KQ_EV_DISABLE, EV_ENABLE as KQ_EV_ENABLE, EV_EOF as KQ_EV_EOF,
+        EV_ERROR as KQ_EV_ERROR, EV_FLAG1 as KQ_EV_FLAG1, EV_ONESHOT as KQ_EV_ONESHOT,
+        EV_SYSFLAGS as KQ_EV_SYSFLAGS, EVFILT_AIO as KQ_FILTER_AIO, EVFILT_PROC as KQ_FILTER_PROC,
+        EVFILT_READ as KQ_FILTER_READ, EVFILT_SIGNAL as KQ_FILTER_SIGNAL,
+        EVFILT_TIMER as KQ_FILTER_TIMER, EVFILT_VNODE as KQ_FILTER_VNODE,
+        EVFILT_WRITE as KQ_FILTER_WRITE, NOTE_ATTRIB as KQ_NOTE_ATTRIB,
+        NOTE_CHILD as KQ_NOTE_CHILD, NOTE_DELETE as KQ_NOTE_DELETE, NOTE_EXEC as KQ_NOTE_EXEC,
+        NOTE_EXIT as KQ_NOTE_EXIT, NOTE_EXTEND as KQ_NOTE_EXTEND, NOTE_FORK as KQ_NOTE_FORK,
+        NOTE_LINK as KQ_NOTE_LINK, NOTE_LOWAT as KQ_NOTE_LOWAT,
+        NOTE_PCTRLMASK as KQ_NOTE_PCTRLMASK, NOTE_PDATAMASK as KQ_NOTE_PDATAMASK,
+        NOTE_RENAME as KQ_NOTE_RENAME, NOTE_REVOKE as KQ_NOTE_REVOKE, NOTE_TRACK as KQ_NOTE_TRACK,
+        NOTE_TRACKERR as KQ_NOTE_TRACKERR, NOTE_WRITE as KQ_NOTE_WRITE,
+    };
+
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    ))]
+    pub(super) mod kqueue {
+        use super::*;
+        use crate::vm::{
+            Py, PyObject, PyPayload, PyRef,
+            builtins::PyType,
+            class_or_notimplemented,
+            common::lock::PyRwLock,
+            convert::{IntoPyException, ToPyObject},
+            function::PyComparisonValue,
+            types::{Comparable, Constructor, Destructor, PyComparisonOp, Representable},
+        };
+        use alloc::sync::Arc;
+        use core::sync::atomic::{
+            AtomicI16, AtomicI32, AtomicI64, AtomicU16, AtomicU32, AtomicU64, Ordering,
+        };
+        use std::time::Instant;
+
+        #[pyclass(module = "select", name = "kevent")]
+        #[derive(Debug, PyPayload)]
+        pub(crate) struct PyKevent {
+            #[pymember(writable)]
+            ident: AtomicU64,
+            #[pymember(writable)]
+            filter: AtomicI16,
+            #[pymember(writable)]
+            flags: AtomicU16,
+            #[pymember(writable)]
+            fflags: AtomicU32,
+            #[pymember(writable)]
+            data: AtomicI64,
+            #[pymember(writable)]
+            udata: AtomicU64,
+        }
+
+        // `ident`/`udata` live in `AtomicU64` and `data` in `AtomicI64`.
+        // Pointer-sized inputs widen into those cells. The cells are not
+        // `usize`/`c_long`, so those widths need not match.
+        const _: () = assert!(
+            core::mem::size_of::<usize>() <= core::mem::size_of::<u64>()
+                && core::mem::size_of::<isize>() <= core::mem::size_of::<i64>()
+        );
+
+        #[derive(FromArgs)]
+        pub(crate) struct KeventNewArgs {
+            #[pyarg(any)]
+            ident: PyObjectRef,
+            #[pyarg(any, default = host_select::kqueue::DEFAULT_FILTER)]
+            filter: i16,
+            #[pyarg(any, default = host_select::kqueue::DEFAULT_FLAGS)]
+            flags: u16,
+            #[pyarg(any, default)]
+            fflags: u32,
+            #[pyarg(any, default)]
+            data: isize,
+            #[pyarg(any, default)]
+            udata: usize,
+        }
+
+        fn ident_from_object(obj: &PyObject, vm: &VirtualMachine) -> PyResult<usize> {
+            if let Some(idx) = obj.try_index_opt(vm) {
+                let n = idx?;
+                n.try_to_primitive(vm).map_err(|_| {
+                    vm.new_overflow_error("Python int too large for C kqueue event identifier")
+                })
+            } else {
+                Selectable::try_from_object(vm, obj.to_owned()).map(|s| s.fno as usize)
+            }
+        }
+
+        impl Constructor for PyKevent {
+            type Args = KeventNewArgs;
+
+            fn py_new(_cls: &Py<PyType>, args: Self::Args, vm: &VirtualMachine) -> PyResult<Self> {
+                let ident = ident_from_object(&args.ident, vm)?;
+                Ok(Self {
+                    ident: AtomicU64::new(ident as u64),
+                    filter: AtomicI16::new(args.filter),
+                    flags: AtomicU16::new(args.flags),
+                    fflags: AtomicU32::new(args.fflags),
+                    data: AtomicI64::new(args.data as i64),
+                    udata: AtomicU64::new(args.udata as u64),
+                })
+            }
+        }
+
+        #[pyclass(with(Constructor, Comparable, Representable))]
+        impl PyKevent {
+            pub(super) fn event(&self) -> host_select::kqueue::Event {
+                host_select::kqueue::Event {
+                    ident: self.ident.load(Ordering::Relaxed) as usize,
+                    filter: self.filter.load(Ordering::Relaxed),
+                    flags: self.flags.load(Ordering::Relaxed),
+                    fflags: self.fflags.load(Ordering::Relaxed),
+                    data: self.data.load(Ordering::Relaxed) as isize,
+                    udata: self.udata.load(Ordering::Relaxed) as usize,
+                }
+            }
+
+            pub(super) fn from_event(ev: host_select::kqueue::Event) -> Self {
+                Self {
+                    ident: AtomicU64::new(ev.ident as u64),
+                    filter: AtomicI16::new(ev.filter),
+                    flags: AtomicU16::new(ev.flags),
+                    fflags: AtomicU32::new(ev.fflags),
+                    data: AtomicI64::new(ev.data as i64),
+                    udata: AtomicU64::new(ev.udata as u64),
+                }
+            }
+        }
+
+        impl Comparable for PyKevent {
+            fn cmp(
+                zelf: &Py<Self>,
+                other: &PyObject,
+                op: PyComparisonOp,
+                _vm: &VirtualMachine,
+            ) -> PyResult<PyComparisonValue> {
+                let other = class_or_notimplemented!(Self, other);
+                let a = zelf.event();
+                let b = other.event();
+                let ord = a
+                    .ident
+                    .cmp(&b.ident)
+                    .then_with(|| a.filter.cmp(&b.filter))
+                    .then_with(|| a.flags.cmp(&b.flags))
+                    .then_with(|| a.fflags.cmp(&b.fflags))
+                    .then_with(|| a.data.cmp(&b.data))
+                    .then_with(|| a.udata.cmp(&b.udata));
+                Ok(PyComparisonValue::Implemented(op.eval_ord(ord)))
+            }
+        }
+
+        impl Representable for PyKevent {
+            fn repr_str(zelf: &Py<Self>, _vm: &VirtualMachine) -> PyResult<String> {
+                let e = zelf.event();
+                Ok(format!(
+                    "<select.kevent ident={} filter={} flags=0x{:x} fflags=0x{:x} data=0x{:x} udata={:p}>",
+                    e.ident, e.filter, e.flags, e.fflags, e.data, e.udata as *const (),
+                ))
+            }
+        }
+
+        #[pyclass(module = "select", name = "kqueue")]
+        #[derive(Debug, PyPayload)]
+        pub(crate) struct PyKqueue {
+            kqfd: PyRwLock<Option<Arc<AtomicI32>>>,
+        }
+
+        impl Constructor for PyKqueue {
+            type Args = ();
+
+            fn py_new(_cls: &Py<PyType>, _args: Self::Args, vm: &VirtualMachine) -> PyResult<Self> {
+                let kqfd = host_select::kqueue::create().map_err(|e| e.into_pyexception(vm))?;
+                Ok(Self {
+                    kqfd: PyRwLock::new(Some(kqfd)),
+                })
+            }
+        }
+
+        impl Destructor for PyKqueue {
+            fn del(zelf: &Py<Self>, _vm: &VirtualMachine) -> PyResult<()> {
+                let cell = zelf.kqfd.write().take();
+                if let Some(cell) = cell {
+                    let _ = host_select::kqueue::close(&cell);
+                }
+                Ok(())
+            }
+        }
+
+        #[derive(FromArgs)]
+        struct KqueueControlArgs {
+            #[pyarg(positional)]
+            changelist: PyObjectRef,
+            #[pyarg(positional)]
+            maxevents: i32,
+            #[pyarg(positional, optional)]
+            timeout: Option<PyObjectRef>,
+        }
+
+        fn timespec_from_timeout(
+            timeout: Option<&PyObject>,
+            vm: &VirtualMachine,
+        ) -> PyResult<Option<host_select::kqueue::Timespec>> {
+            let timeout = timeout_nanoseconds(timeout, false, vm)?;
+            if timeout.is_some_and(|ns| ns < 0) {
+                return Err(vm.new_value_error("timeout must be positive or None"));
+            }
+            Ok(timeout_duration(timeout).map(host_select::kqueue::Timespec::from_duration))
+        }
+
+        #[pyclass(with(Constructor, Destructor))]
+        impl PyKqueue {
+            #[pymethod]
+            fn close(zelf: &Py<Self>) -> io::Result<()> {
+                let cell = zelf.kqfd.write().take();
+                if let Some(cell) = cell {
+                    host_select::kqueue::close(&cell)?;
+                }
+                Ok(())
+            }
+
+            #[pygetset]
+            fn closed(zelf: &Py<Self>) -> bool {
+                zelf.kqfd
+                    .read()
+                    .as_ref()
+                    .is_none_or(|cell| host_select::kqueue::fd(cell) < 0)
+            }
+
+            fn fd_or_closed(cell: Option<&Arc<AtomicI32>>, vm: &VirtualMachine) -> PyResult<i32> {
+                match cell {
+                    Some(cell) => {
+                        let fd = host_select::kqueue::fd(cell);
+                        if fd < 0 {
+                            Err(vm.new_value_error("I/O operation on closed kqueue object"))
+                        } else {
+                            Ok(fd)
+                        }
+                    }
+                    None => Err(vm.new_value_error("I/O operation on closed kqueue object")),
+                }
+            }
+
+            #[pymethod]
+            fn fileno(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<i32> {
+                Self::fd_or_closed(zelf.kqfd.read().as_ref(), vm)
+            }
+
+            #[pyclassmethod]
+            fn fromfd(cls: PyTypeRef, fd: i32, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
+                Self {
+                    kqfd: PyRwLock::new(Some(host_select::kqueue::from_fd(fd))),
+                }
+                .into_ref_with_type(vm, cls)
+            }
+
+            #[pymethod]
+            fn control(
+                zelf: &Py<Self>,
+                args: KqueueControlArgs,
+                vm: &VirtualMachine,
+            ) -> PyResult<PyListRef> {
+                Self::fd_or_closed(zelf.kqfd.read().as_ref(), vm)?;
+                if args.maxevents < 0 {
+                    return Err(vm.new_value_error(format!(
+                        "Length of eventlist must be 0 or positive, got {}",
+                        args.maxevents
+                    )));
+                }
+
+                let mut timeout = timespec_from_timeout(args.timeout.as_deref(), vm)?;
+                let changelist = if vm.is_none(&args.changelist) {
+                    Vec::new()
+                } else {
+                    let items: Vec<PyRef<PyKevent>> =
+                        vm.extract_elements_with(&args.changelist, |item| {
+                            item.downcast().map_err(|_| {
+                                vm.new_type_error(
+                                    "changelist must be an iterable of select.kevent objects",
+                                )
+                            })
+                        })?;
+                    if items.len() > i32::MAX as usize {
+                        return Err(vm.new_overflow_error("changelist is too long"));
+                    }
+                    items.iter().map(|ev| ev.event()).collect()
+                };
+
+                let mut eventlist =
+                    vec![host_select::kqueue::Event::default(); args.maxevents as usize];
+
+                let deadline = timeout_deadline(timeout.and_then(|ts| ts.to_duration()), vm)?;
+                let n = loop {
+                    let result = {
+                        let guard = zelf.kqfd.read();
+                        let fd = Self::fd_or_closed(guard.as_ref(), vm)?;
+                        vm.allow_threads(|| {
+                            host_select::kqueue::kevent(
+                                fd,
+                                &changelist,
+                                &mut eventlist,
+                                timeout.as_ref(),
+                            )
+                        })
+                    };
+                    match result {
+                        Ok(n) => break n,
+                        Err(err) if err.kind() == io::ErrorKind::Interrupted => {
+                            vm.check_signals()?;
+                            if let Some(deadline) = deadline {
+                                if let Some(remaining) =
+                                    deadline.checked_duration_since(Instant::now())
+                                {
+                                    timeout = Some(host_select::kqueue::Timespec::from_duration(
+                                        remaining,
+                                    ));
+                                } else {
+                                    break 0;
+                                }
+                            }
+                        }
+                        Err(err) => return Err(err.into_pyexception(vm)),
+                    }
+                };
+
+                let out = eventlist
+                    .into_iter()
+                    .take(n)
+                    .map(|ev| PyKevent::from_event(ev).to_pyobject(vm))
+                    .collect();
+                Ok(vm.ctx.new_list(out))
+            }
+        }
+    }
+}

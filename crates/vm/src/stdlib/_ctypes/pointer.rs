@@ -1,0 +1,637 @@
+use super::base::CDATA_BUFFER_METHODS;
+use super::{PyCData, StgInfo, StgInfoFlags};
+use crate::atomic_func;
+use crate::protocol::{
+    BufferDescriptor, PyBuffer, PyMappingMethods, PyNumberMethods, PySequenceMethods,
+};
+use crate::types::{AsBuffer, AsMapping, AsNumber, AsSequence, Constructor, Initializer};
+use crate::{
+    AsObject, Py, PyObject, PyObjectRef, PyPayload, PyResult, VirtualMachine,
+    builtins::{PyInt, PyList, PySlice, PyType, PyTypeRef},
+    function::{FuncArgs, OptionalArg},
+};
+use alloc::borrow::Cow;
+use num_traits::ToPrimitive;
+use rustpython_host_env::ctypes::{
+    pointer_item_address, read_pointer_char_slice, read_pointer_wchar_slice,
+};
+
+#[pyclass(name = "PyCPointerType", base = PyType, module = "_ctypes")]
+#[derive(Debug)]
+#[repr(transparent)]
+pub(super) struct PyCPointerType(PyType);
+
+impl Initializer for PyCPointerType {
+    type Args = FuncArgs;
+
+    fn init(zelf: &crate::Py<Self>, _args: Self::Args, vm: &VirtualMachine) -> PyResult<()> {
+        // Get the type as PyTypeRef
+        let obj: PyObjectRef = zelf.to_owned().into();
+        let new_type: PyTypeRef = obj
+            .downcast()
+            .map_err(|_| vm.new_type_error("expected type"))?;
+
+        if new_type.is_initialized() {
+            return Ok(());
+        }
+
+        // Get the _type_ attribute (element type)
+        let proto = new_type
+            .as_object()
+            .get_attr("_type_", vm)
+            .ok()
+            .and_then(|obj| obj.downcast::<PyType>().ok());
+
+        // Validate that _type_ has storage info (is a ctypes type)
+        if let Some(ref proto_type) = proto
+            && proto_type.stg_info_opt().is_none()
+        {
+            return Err(vm.new_type_error(format!("{} must have storage info", proto_type.name())));
+        }
+
+        // Initialize StgInfo for pointer type
+        let pointer_size = rustpython_host_env::ctypes::pointer_size();
+        let mut stg_info = StgInfo::new(pointer_size, pointer_size);
+        stg_info.proto = proto;
+        stg_info.paramfunc = super::base::ParamFunc::Pointer;
+        stg_info.length = 1;
+        stg_info.flags |= StgInfoFlags::TYPEFLAG_ISPOINTER;
+
+        // Set format string: "&<element_format>" or "&(shape)<element_format>" for arrays
+        if let Some(ref proto) = stg_info.proto
+            && let Some(item_info) = proto.stg_info_opt()
+        {
+            let current_format = item_info.format.as_deref().unwrap_or("B");
+            // Include shape for array types in the pointer format
+            let shape_str = if !item_info.shape.is_empty() {
+                let dims: Vec<String> = item_info.shape.iter().map(|d| d.to_string()).collect();
+                format!("({})", dims.join(","))
+            } else {
+                String::new()
+            };
+            stg_info.format = Some(format!("&{shape_str}{current_format}"));
+        }
+
+        let _ = new_type.init_traced_type_data(stg_info);
+
+        // Cache: set target_type.__pointer_type__ = self (via StgInfo, not as inheritable attr)
+        if let Ok(type_attr) = new_type.as_object().get_attr("_type_", vm)
+            && let Ok(target_type) = type_attr.downcast::<PyType>()
+            && let Some(mut target_info) = target_type.get_type_data_mut::<StgInfo>()
+        {
+            let zelf_obj: PyObjectRef = zelf.to_owned().into();
+            let _old = target_info.pointer_type.replace(zelf_obj);
+            drop(target_info);
+        }
+
+        Ok(())
+    }
+}
+
+#[pyclass(flags(BASETYPE, IMMUTABLETYPE), with(AsSequence, Initializer))]
+impl PyCPointerType {
+    #[pygetset]
+    fn __pointer_type__(zelf: PyTypeRef, vm: &VirtualMachine) -> PyResult {
+        super::base::pointer_type_get(&zelf, vm)
+    }
+
+    #[pygetset(setter)]
+    fn set___pointer_type__(
+        zelf: PyTypeRef,
+        value: PyObjectRef,
+        vm: &VirtualMachine,
+    ) -> PyResult<()> {
+        super::base::pointer_type_set(&zelf, value, vm)
+    }
+
+    #[pymethod]
+    fn from_param(cls: PyTypeRef, value: PyObjectRef, vm: &VirtualMachine) -> PyResult {
+        // None is allowed for pointer types
+        if vm.is_none(&value) {
+            return Ok(value);
+        }
+
+        // Conversion follows the initialized prototype, not a later assignment
+        // to _type_. Release the metadata borrow before instance/subclass checks.
+        let proto = cls.stg_info(vm)?.proto.clone().ok_or_else(|| {
+            vm.new_type_error("cannot convert argument: POINTER _type_ type is not set")
+        })?;
+
+        // A direct referent is implicitly passed by reference. This special
+        // conversion does not apply to values found through _as_parameter_.
+        if value.is_instance(proto.as_object(), vm)? {
+            // Return byref(value)
+            return super::_ctypes::byref(
+                super::_ctypes::ByRefArgs {
+                    obj: value,
+                    offset: 0,
+                },
+                vm,
+            );
+        }
+
+        // Array/Pointer instances with compatible proto
+        // "Array instances are also pointers when the item types are the same."
+        if value.downcast_ref::<PyCPointer>().is_some()
+            || value.downcast_ref::<super::array::PyCArray>().is_some()
+        {
+            let value_proto = value.class().stg_info(vm)?.proto.clone();
+            if let Some(value_proto) = value_proto
+                && value_proto.as_object().is_subclass(proto.as_object(), vm)?
+            {
+                return Ok(value);
+            }
+        }
+
+        PyCData::from_param(cls, value, vm)
+    }
+
+    // PyCPointerType_set_type: Complete an incomplete pointer type
+    #[pymethod]
+    fn set_type(zelf: PyTypeRef, typ: PyObjectRef, vm: &VirtualMachine) -> PyResult<()> {
+        use crate::AsObject;
+
+        // 1. Validate that typ is a type
+        let typ_type = typ
+            .downcast::<PyType>()
+            .map_err(|_| vm.new_type_error("_type_ must be a type"))?;
+
+        // 2. Validate that typ has storage info
+        if typ_type.stg_info_opt().is_none() {
+            return Err(vm.new_type_error("_type_ must have storage info"));
+        }
+
+        // 3. Update StgInfo.proto and format using mutable access
+        if let Some(mut stg_info) = zelf.get_type_data_mut::<StgInfo>() {
+            stg_info.proto = Some(typ_type.clone());
+
+            // Update format string: "&<element_format>" or "&(shape)<element_format>" for arrays
+            let item_info = typ_type.stg_info_opt().expect("proto has StgInfo");
+            let current_format = item_info.format.as_deref().unwrap_or("B");
+            // Include shape for array types in the pointer format
+            let shape_str = if !item_info.shape.is_empty() {
+                let dims: Vec<String> = item_info.shape.iter().map(|d| d.to_string()).collect();
+                format!("({})", dims.join(","))
+            } else {
+                String::new()
+            };
+            stg_info.format = Some(format!("&{shape_str}{current_format}"));
+        }
+
+        // 4. Set _type_ attribute on the pointer type
+        zelf.as_object().set_attr("_type_", typ_type.clone(), vm)?;
+
+        // 5. Cache: set target_type.__pointer_type__ = self (via StgInfo)
+        if let Some(mut target_info) = typ_type.get_type_data_mut::<StgInfo>() {
+            let _old = target_info.pointer_type.replace(zelf.into());
+            drop(target_info);
+        }
+
+        Ok(())
+    }
+}
+
+impl AsSequence for PyCPointerType {
+    fn as_sequence() -> &'static PySequenceMethods {
+        &super::array::CTYPE_SEQUENCE_METHODS
+    }
+}
+
+// `contents` is a computed property, not a stored field.
+#[pyclass(
+    name = "_Pointer",
+    base = PyCData,
+    metaclass = "PyCPointerType",
+    module = "_ctypes",
+    traverse = "manual"
+)]
+#[derive(Debug)]
+#[repr(transparent)]
+pub(crate) struct PyCPointer(pub PyCData);
+
+// SAFETY: this transparent wrapper owns exactly the references in its base.
+unsafe impl crate::object::Traverse for PyCPointer {
+    fn traverse(&self, tracer: &mut crate::object::TraverseFn<'_>) {
+        self.0.traverse(tracer);
+    }
+    fn clear(&mut self, out: &mut Vec<PyObjectRef>) {
+        self.0.clear(out);
+    }
+}
+
+impl Constructor for PyCPointer {
+    type Args = FuncArgs;
+
+    fn slot_new(cls: PyTypeRef, _args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+        // Pointer_new: Check if _type_ is defined
+        let has_type = cls.stg_info_opt().is_some_and(|info| info.proto.is_some());
+        if !has_type {
+            return Err(vm.new_type_error("Cannot create instance: has no _type_"));
+        }
+
+        // Create a new PyCPointer instance with NULL pointer (all zeros)
+        // Initial contents is set via __init__ if provided
+        let cdata = PyCData::from_bytes(rustpython_host_env::ctypes::null_pointer_bytes(), None);
+        // pointer instance has b_length set to 2 (for index 0 and 1)
+        cdata.length.store(2);
+        Self(cdata).into_ref_with_type(vm, cls).map(Into::into)
+    }
+
+    fn py_new(_cls: &Py<PyType>, _args: Self::Args, _vm: &VirtualMachine) -> PyResult<Self> {
+        unimplemented!("use slot_new")
+    }
+}
+
+impl Initializer for PyCPointer {
+    type Args = (OptionalArg<PyObjectRef>,);
+
+    fn init(zelf: &Py<Self>, args: Self::Args, vm: &VirtualMachine) -> PyResult<()> {
+        let (value,) = args;
+        if let OptionalArg::Present(val) = value
+            && !vm.is_none(&val)
+        {
+            Self::set_contents(zelf, val, vm)?;
+        }
+        Ok(())
+    }
+}
+
+#[pyclass(
+    flags(BASETYPE, IMMUTABLETYPE),
+    with(Constructor, Initializer, AsNumber, AsBuffer, AsMapping)
+)]
+impl PyCPointer {
+    /// Get the pointer value stored in buffer as usize
+    pub(crate) fn get_ptr_value(&self) -> usize {
+        let buffer = self.0.buffer.read();
+        rustpython_host_env::ctypes::read_pointer_from_buffer(&buffer)
+    }
+
+    /// Set the pointer value in buffer
+    pub(crate) fn set_ptr_value(&self, value: usize) {
+        self.0.write_bytes_at_offset(0, &value.to_ne_bytes());
+    }
+
+    // contents getter - reads address from b_ptr and creates an instance of the pointed-to type
+    #[pygetset]
+    fn contents(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyObjectRef> {
+        // Pointer_get_contents
+        let ptr_val = zelf.get_ptr_value();
+        if ptr_val == 0 {
+            return Err(vm.new_value_error("NULL pointer access"));
+        }
+
+        // Get element type from StgInfo.proto
+        let stg_info = zelf.class().stg_info(vm)?;
+        let proto_type = stg_info.proto();
+        let element_size = proto_type
+            .stg_info_opt()
+            .map_or_else(rustpython_host_env::ctypes::pointer_size, |info| info.size);
+
+        // SAFETY: the pointer must designate valid native memory. Retaining it
+        // keeps Python-owned referents alive, but cannot validate arbitrary addresses.
+        let cdata = unsafe {
+            PyCData::from_base_obj(ptr_val as *mut u8, element_size, zelf.to_owned().into(), 0)
+        };
+        cdata.length.store(proto_type.stg_info(vm)?.length);
+        cdata.into_view(proto_type.to_owned(), vm)
+    }
+
+    // contents setter - stores address in b_ptr and keeps reference
+    // Pointer_set_contents
+    #[pygetset(setter)]
+    fn set_contents(zelf: &Py<Self>, value: PyObjectRef, vm: &VirtualMachine) -> PyResult<()> {
+        // Get stginfo and proto for type validation
+        let stg_info = zelf.class().stg_info(vm)?;
+        let proto = stg_info.proto();
+
+        // Check if value is CData, or isinstance(value, proto)
+        let cdata = if let Some(c) = value.downcast_ref::<PyCData>() {
+            c
+        } else if value.is_instance(proto.as_object(), vm)? {
+            value
+                .downcast_ref::<PyCData>()
+                .ok_or_else(|| vm.new_type_error("expected ctypes instance"))?
+        } else {
+            return Err(vm.new_type_error(format!(
+                "expected {} instead of {}",
+                proto.name(),
+                value.class().name()
+            )));
+        };
+
+        // Set pointer value
+        {
+            let buffer = cdata.buffer.read();
+            let addr = buffer.as_ptr() as usize;
+            drop(buffer);
+            zelf.set_ptr_value(addr);
+        }
+
+        // KeepRef: store the object directly with index 1
+        zelf.0.keep_ref(1, value.clone(), vm)?;
+
+        // KeepRef: store GetKeepedObjects(dst) at index 0
+        let objects = cdata.objects.read().clone();
+        if let Some(kept) = objects {
+            zelf.0.keep_ref(0, kept, vm)?;
+        }
+
+        Ok(())
+    }
+
+    // Pointer_subscript
+    fn __getitem__(zelf: &Py<Self>, item: &PyObject, vm: &VirtualMachine) -> PyResult {
+        // PyIndex_Check
+        if let Some(i) = item.downcast_ref::<PyInt>() {
+            let i = i.as_bigint().to_isize().ok_or_else(|| {
+                vm.new_index_error("cannot fit index into an index-sized integer")
+            })?;
+            // Note: Pointer does NOT adjust negative indices (no length)
+            Self::getitem_by_index(zelf, i, vm)
+        }
+        // PySlice_Check
+        else if let Some(slice) = item.downcast_ref::<PySlice>() {
+            Self::getitem_by_slice(zelf, slice, vm)
+        } else {
+            Err(vm.new_type_error("Pointer indices must be integer"))
+        }
+    }
+
+    // Pointer_item
+    fn getitem_by_index(zelf: &Py<Self>, index: isize, vm: &VirtualMachine) -> PyResult {
+        // if (*(void **)self->b_ptr == NULL) { PyErr_SetString(...); }
+        let ptr_value = zelf.get_ptr_value();
+        if ptr_value == 0 {
+            return Err(vm.new_value_error("NULL pointer access"));
+        }
+
+        // Get element type and size from StgInfo.proto
+        let stg_info = zelf.class().stg_info(vm)?;
+        let proto_type = stg_info.proto();
+        let element_size = proto_type
+            .stg_info_opt()
+            .map_or_else(rustpython_host_env::ctypes::pointer_size, |info| info.size);
+
+        // offset = index * iteminfo->size
+        let addr = pointer_item_address(ptr_value, index, element_size);
+
+        // Direct simple types and their generated endian variants return a
+        // scalar; user subclasses and aggregates return a view.
+        if super::simple::returns_scalar(proto_type) {
+            // SAFETY: pointer indexing requires valid native storage covering
+            // the element. Ownership of arbitrary addresses remains the caller's
+            // responsibility, as for the view returned below.
+            let bytes = unsafe {
+                rustpython_host_env::ctypes::borrow_memory(addr as *const u8, element_size)
+            };
+            if proto_type.stg_info(vm)?.scalar_code == Some('O') {
+                return zelf.0.object_at(
+                    rustpython_host_env::ctypes::read_pointer_from_buffer(bytes),
+                    addr,
+                    Some(index as usize),
+                    vm,
+                );
+            }
+            if super::simple::is_swapped(proto_type) {
+                let mut bytes = bytes.to_vec();
+                bytes.reverse();
+                return Ok(super::base::bytes_to_pyobject(proto_type, &bytes, vm));
+            }
+            return Ok(super::base::bytes_to_pyobject(proto_type, bytes, vm));
+        }
+
+        // Complex type: create instance that references the memory directly (not a copy)
+        // This allows p[i].val = x to modify the original memory
+        // SAFETY: pointer indexing relies on the caller providing valid native
+        // memory. Retaining the pointer keeps its Python-owned referents alive,
+        // but does not make arbitrary addresses or concurrent native access safe.
+        let cdata = unsafe {
+            PyCData::from_base_obj(
+                addr as *mut u8,
+                element_size,
+                zelf.to_owned().into(),
+                index as usize,
+            )
+        };
+        cdata.length.store(proto_type.stg_info(vm)?.length);
+        cdata.into_view(proto_type.to_owned(), vm)
+    }
+
+    // Pointer_subscript slice handling (manual parsing, not PySlice_Unpack)
+    fn getitem_by_slice(zelf: &Py<Self>, slice: &Py<PySlice>, vm: &VirtualMachine) -> PyResult {
+        // Since pointers have no length, we have to dissect the slice ourselves
+
+        // step: defaults to 1, step == 0 is error
+        let step: isize = if let Some(ref step_obj) = slice.step
+            && !vm.is_none(step_obj)
+        {
+            let s = step_obj
+                .try_int(vm)?
+                .as_bigint()
+                .to_isize()
+                .ok_or_else(|| vm.new_value_error("slice step too large"))?;
+            if s == 0 {
+                return Err(vm.new_value_error("slice step cannot be zero"));
+            }
+            s
+        } else {
+            1
+        };
+
+        // start: defaults to 0, but required if step < 0
+        let start: isize = if let Some(ref start_obj) = slice.start
+            && !vm.is_none(start_obj)
+        {
+            start_obj
+                .try_int(vm)?
+                .as_bigint()
+                .to_isize()
+                .ok_or_else(|| vm.new_value_error("slice start too large"))?
+        } else {
+            if step < 0 {
+                return Err(vm.new_value_error("slice start is required for step < 0"));
+            }
+            0
+        };
+
+        // stop: ALWAYS required for pointers
+        if vm.is_none(&slice.stop) {
+            return Err(vm.new_value_error("slice stop is required"));
+        }
+        let stop: isize = slice
+            .stop
+            .try_int(vm)?
+            .as_bigint()
+            .to_isize()
+            .ok_or_else(|| vm.new_value_error("slice stop too large"))?;
+
+        // calculate length
+        let len: usize = if (step > 0 && start > stop) || (step < 0 && start < stop) {
+            0
+        } else if step > 0 {
+            ((stop - start - 1) / step + 1) as usize
+        } else {
+            ((stop - start + 1) / step + 1) as usize
+        };
+
+        // Get element info
+        let stg_info = zelf.class().stg_info(vm)?;
+        let element_size = if let Some(ref proto_type) = stg_info.proto {
+            proto_type.stg_info_opt().expect("proto has StgInfo").size
+        } else {
+            rustpython_host_env::ctypes::pointer_size()
+        };
+        let type_code = stg_info.proto.as_ref().and_then(|p| p.type_code(vm));
+
+        let ptr_value = zelf.get_ptr_value();
+
+        // c_char → bytes
+        if type_code.as_deref() == Some("c") {
+            if len == 0 {
+                return Ok(vm.ctx.new_bytes(vec![]).into());
+            }
+            let result =
+                unsafe { read_pointer_char_slice(ptr_value, start, len, step, element_size) };
+            return Ok(vm.ctx.new_bytes(result).into());
+        }
+
+        // c_wchar → str
+        if type_code.as_deref() == Some("u") {
+            if len > 0
+                && let Some(s) = unsafe { read_pointer_wchar_slice(ptr_value, start, len, step) }
+            {
+                return Ok(vm.ctx.new_str(s).into());
+            }
+            return Ok(vm.ctx.new_str("").into());
+        }
+
+        // other types → list with Pointer_item for each
+        let mut items = Vec::with_capacity(len);
+        let mut cur = start;
+        for _ in 0..len {
+            items.push(Self::getitem_by_index(zelf, cur, vm)?);
+            cur += step;
+        }
+        Ok(PyList::from(items).into_ref(&vm.ctx).into())
+    }
+
+    // Pointer_ass_item
+    fn __setitem__(
+        zelf: &Py<Self>,
+        item: &PyObject,
+        value: PyObjectRef,
+        vm: &VirtualMachine,
+    ) -> PyResult<()> {
+        // Pointer does not support item deletion (value always provided)
+        // only integer indices supported for setitem
+        if let Some(i) = item.downcast_ref::<PyInt>() {
+            let i = i.as_bigint().to_isize().ok_or_else(|| {
+                vm.new_index_error("cannot fit index into an index-sized integer")
+            })?;
+            Self::setitem_by_index(zelf, i, value, vm)
+        } else {
+            Err(vm.new_type_error("Pointer indices must be integer"))
+        }
+    }
+
+    fn setitem_by_index(
+        zelf: &Py<Self>,
+        index: isize,
+        value: PyObjectRef,
+        vm: &VirtualMachine,
+    ) -> PyResult<()> {
+        let ptr_value = zelf.get_ptr_value();
+        if ptr_value == 0 {
+            return Err(vm.new_value_error("NULL pointer access"));
+        }
+
+        let proto_type = zelf.class().stg_info(vm)?.proto().to_owned();
+        let element_size = proto_type.stg_info(vm)?.size;
+        let addr = pointer_item_address(ptr_value, index, element_size);
+        let write = if proto_type
+            .stg_info(vm)?
+            .flags
+            .intersects(StgInfoFlags::TYPEFLAG_ISPOINTER | StgInfoFlags::TYPEFLAG_HASPOINTER)
+        {
+            PyCData::register_pyobject_writer(
+                zelf.as_object(),
+                addr,
+                element_size,
+                index as usize,
+                vm,
+            )?
+        } else {
+            super::base::CDataWrite::default()
+        };
+        let mut prepared = super::base::CDataValue::new(
+            &proto_type,
+            &value,
+            element_size,
+            super::simple::is_swapped(&proto_type),
+            vm,
+        )?;
+        write.publish(vm)?;
+        // SAFETY: pointer indexing has the same caller-provided valid-storage
+        // requirement as reading the element. The source snapshot cannot overlap it.
+        unsafe {
+            let previous =
+                rustpython_host_env::ctypes::borrow_memory(addr as *const u8, element_size);
+            prepared.bytes.replace(previous);
+            rustpython_host_env::ctypes::copy_bytes_to_address(addr, &prepared.bytes, element_size);
+        }
+        prepared.keep(&zelf.0, index as usize, vm)
+    }
+}
+
+impl AsNumber for PyCPointer {
+    fn as_number() -> &'static PyNumberMethods {
+        static AS_NUMBER: PyNumberMethods = PyNumberMethods {
+            boolean: Some(|number, _vm| {
+                let zelf = number.obj.downcast_ref::<PyCPointer>().unwrap();
+                Ok(zelf.get_ptr_value() != 0)
+            }),
+            ..PyNumberMethods::NOT_IMPLEMENTED
+        };
+        &AS_NUMBER
+    }
+}
+
+impl AsMapping for PyCPointer {
+    fn as_mapping() -> &'static PyMappingMethods {
+        use crate::common::lock::LazyLock;
+        static AS_MAPPING: LazyLock<PyMappingMethods> = LazyLock::new(|| PyMappingMethods {
+            subscript: atomic_func!(|mapping, needle, vm| {
+                let zelf = PyCPointer::mapping_downcast(mapping);
+                PyCPointer::__getitem__(zelf, needle, vm)
+            }),
+            ass_subscript: atomic_func!(|mapping, needle, value, vm| {
+                let zelf = PyCPointer::mapping_downcast(mapping);
+                match value {
+                    Some(value) => PyCPointer::__setitem__(zelf, needle, value, vm),
+                    None => Err(vm.new_type_error("Pointer does not support item deletion")),
+                }
+            }),
+            ..PyMappingMethods::NOT_IMPLEMENTED
+        });
+        &AS_MAPPING
+    }
+}
+
+impl AsBuffer for PyCPointer {
+    fn as_buffer(zelf: &Py<Self>, _vm: &VirtualMachine) -> PyResult<PyBuffer> {
+        let stg_info = zelf
+            .class()
+            .stg_info_opt()
+            .expect("PyCPointer type must have StgInfo");
+        let format = stg_info
+            .format
+            .clone()
+            .map_or(Cow::Borrowed("&B"), Cow::Owned);
+        let itemsize = stg_info.size;
+        // Pointer types are scalars with ndim=0, shape=()
+        let desc = BufferDescriptor::from_dim_desc(itemsize, 0, false, itemsize, format, vec![]);
+        let buf = PyBuffer::new(zelf.to_owned().into(), desc, &CDATA_BUFFER_METHODS);
+        Ok(buf)
+    }
+}

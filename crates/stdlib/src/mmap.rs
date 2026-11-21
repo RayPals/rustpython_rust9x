@@ -1,0 +1,1606 @@
+// spell-checker:disable
+//! mmap module
+pub(crate) use mmap::module_def;
+
+#[pymodule]
+mod mmap {
+    use crate::common::{
+        borrow::{BorrowedValue, BorrowedValueMut},
+        lock::{MapImmutable, PyMutex, PyMutexGuard},
+    };
+    use crate::vm::{
+        AsObject, FromArgs, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyResult,
+        TryFromBorrowedObject, VirtualMachine, atomic_func,
+        builtins::{PyBytes, PyBytesRef, PyInt, PyIntRef, PyType, PyTypeRef, PyUtf8StrRef},
+        byte::{bytes_from_object, value_from_object},
+        convert::ToPyException,
+        function::{ArgBytesLike, ArgIndex, ArgIntoBool},
+        protocol::{
+            BufferDescriptor, BufferMethods, PyBuffer, PyMappingMethods, PySequenceMethods,
+        },
+        sliceable::{NameMmap, SaturatedSlice, SequenceIndex, SequenceIndexOp},
+        types::{AsBuffer, AsMapping, AsSequence, Constructor, Representable},
+    };
+    use core::ops::{Deref, DerefMut};
+    use crossbeam_utils::atomic::AtomicCell;
+    use num_traits::{Signed, ToPrimitive};
+    use std::io::Write;
+    #[cfg(windows)]
+    use {core::hint::cold_path, memchr::memchr, rustpython_vm::exceptions};
+
+    #[cfg(unix)]
+    use rustpython_host_env::crt_fd;
+    #[cfg(any(unix, windows))]
+    use rustpython_host_env::mmap as host_mmap;
+
+    #[cfg(windows)]
+    use rustpython_host_env::nt as host_nt;
+
+    #[repr(C)]
+    #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+    enum AccessMode {
+        Default = 0,
+        Read = 1,
+        Write = 2,
+        Copy = 3,
+    }
+
+    #[derive(Copy, Clone)]
+    struct AccessArg(i32);
+
+    impl AccessArg {
+        const DEFAULT: Self = Self(0);
+
+        #[must_use]
+        pub(crate) const fn py_default(self) -> crate::vm::function::DefaultRepr {
+            crate::vm::function::DefaultRepr::Int(self.0 as i128)
+        }
+
+        fn into_mode(self, vm: &VirtualMachine) -> PyResult<AccessMode> {
+            Ok(match self.0 {
+                0 => AccessMode::Default,
+                1 => AccessMode::Read,
+                2 => AccessMode::Write,
+                3 => AccessMode::Copy,
+                _ => return Err(vm.new_value_error("mmap invalid access parameter.")),
+            })
+        }
+    }
+
+    impl<'a> TryFromBorrowedObject<'a> for AccessArg {
+        fn try_from_borrowed_object(vm: &VirtualMachine, obj: &'a PyObject) -> PyResult<Self> {
+            let index = obj.try_index(vm)?;
+            // getargs.c's 'i' converts through C long before checking C int bounds.
+            let value = core::ffi::c_long::try_from(index.as_bigint())
+                .map_err(|_| vm.new_overflow_error("Python int too large to convert to C long"))?;
+            let value = value.to_i32().ok_or_else(|| {
+                vm.new_overflow_error(if value > 0 {
+                    "signed integer is greater than maximum"
+                } else {
+                    "signed integer is less than minimum"
+                })
+            })?;
+            Ok(Self(value))
+        }
+    }
+
+    #[cfg(unix)]
+    #[pyattr]
+    use host_mmap::{
+        MADV_DONTNEED, MADV_NORMAL, MADV_RANDOM, MADV_SEQUENTIAL, MADV_WILLNEED, MAP_ANON,
+        MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, MS_ASYNC, MS_INVALIDATE, MS_SYNC, PROT_EXEC,
+        PROT_READ, PROT_WRITE,
+    };
+
+    #[cfg(target_os = "macos")]
+    #[pyattr]
+    use host_mmap::{MADV_FREE_REUSABLE, MADV_FREE_REUSE};
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "fuchsia",
+        target_os = "freebsd",
+        target_os = "linux",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_vendor = "apple"
+    ))]
+    #[pyattr]
+    use host_mmap::MADV_FREE;
+
+    #[cfg(target_os = "linux")]
+    #[pyattr]
+    use host_mmap::{
+        MADV_DODUMP, MADV_DOFORK, MADV_DONTDUMP, MADV_DONTFORK, MADV_HUGEPAGE, MADV_HWPOISON,
+        MADV_MERGEABLE, MADV_NOHUGEPAGE, MADV_REMOVE, MADV_UNMERGEABLE,
+    };
+
+    #[cfg(any(
+        target_os = "android",
+        all(
+            target_os = "linux",
+            any(
+                target_arch = "aarch64",
+                target_arch = "arm",
+                target_arch = "powerpc",
+                target_arch = "powerpc64",
+                target_arch = "s390x",
+                target_arch = "x86",
+                target_arch = "x86_64",
+                target_arch = "sparc64"
+            )
+        )
+    ))]
+    #[pyattr]
+    use host_mmap::MADV_SOFT_OFFLINE;
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+    #[pyattr]
+    use host_mmap::{MAP_DENYWRITE, MAP_EXECUTABLE, MAP_POPULATE};
+
+    // MAP_STACK is available on Linux, OpenBSD, and NetBSD
+    #[cfg(any(target_os = "linux", target_os = "openbsd", target_os = "netbsd"))]
+    #[pyattr]
+    use host_mmap::MAP_STACK;
+
+    // FreeBSD-specific MADV constants
+    #[cfg(target_os = "freebsd")]
+    #[pyattr]
+    use host_mmap::{MADV_AUTOSYNC, MADV_CORE, MADV_NOCORE, MADV_NOSYNC, MADV_PROTECT};
+
+    // Darwin-specific mapping flags
+    #[cfg(target_vendor = "apple")]
+    #[pyattr]
+    use host_mmap::{
+        MAP_32BIT, MAP_HASSEMAPHORE, MAP_JIT, MAP_NOCACHE, MAP_NOEXTEND, MAP_NORESERVE,
+        MAP_RESILIENT_CODESIGN, MAP_RESILIENT_MEDIA, MAP_TPRO, MAP_TRANSLATED_ALLOW_EXECUTE,
+        MAP_UNIX03,
+    };
+
+    #[pyattr]
+    const ACCESS_DEFAULT: u32 = AccessMode::Default as u32;
+    #[pyattr]
+    const ACCESS_READ: u32 = AccessMode::Read as u32;
+    #[pyattr]
+    const ACCESS_WRITE: u32 = AccessMode::Write as u32;
+    #[pyattr]
+    const ACCESS_COPY: u32 = AccessMode::Copy as u32;
+
+    #[pyattr(name = "PAGESIZE", once)]
+    fn page_size(_vm: &VirtualMachine) -> usize {
+        rustpython_host_env::os::page_size()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[pyattr(name = "ALLOCATIONGRANULARITY", once)]
+    fn granularity(_vm: &VirtualMachine) -> usize {
+        rustpython_host_env::os::alloc_granularity()
+    }
+
+    #[pyattr(name = "error", once)]
+    fn error_type(vm: &VirtualMachine) -> PyTypeRef {
+        vm.ctx.exceptions.os_error.to_owned()
+    }
+
+    #[derive(Debug)]
+    enum MmapObj {
+        #[cfg(unix)]
+        Mapped(host_mmap::MappedFile),
+        #[cfg(windows)]
+        Windows(host_mmap::WindowsMmap),
+    }
+
+    impl MmapObj {
+        fn as_slice(&self) -> &[u8] {
+            match self {
+                #[cfg(unix)]
+                Self::Mapped(mmap) => mmap.as_slice(),
+                #[cfg(windows)]
+                Self::Windows(named) => named.as_slice(),
+            }
+        }
+    }
+
+    #[pyattr]
+    #[pyclass(name = "mmap")]
+    #[derive(Debug, PyPayload)]
+    struct PyMmap {
+        closed: AtomicCell<bool>,
+        mmap: PyMutex<Option<MmapObj>>,
+        #[cfg(unix)]
+        fd: AtomicCell<i32>,
+        #[cfg(windows)]
+        handle: AtomicCell<isize>, // host_mmap::Handle is isize on Windows
+        offset: i64,
+        size: AtomicCell<usize>,
+        pos: AtomicCell<usize>, // relative to offset
+        exports: AtomicCell<usize>,
+        access: AccessMode,
+        trackfd: bool,
+        #[cfg(target_os = "linux")]
+        anonymous: bool,
+        #[cfg(target_os = "linux")]
+        private: bool,
+    }
+
+    impl PyMmap {
+        /// Close the underlying file handle/descriptor if open
+        fn close_handle(&self) {
+            #[cfg(unix)]
+            {
+                let fd = self.fd.swap(-1);
+                host_mmap::close_descriptor(fd);
+            }
+            #[cfg(windows)]
+            {
+                let handle = self.handle.swap(host_mmap::INVALID_HANDLE as isize);
+                if handle != host_mmap::INVALID_HANDLE as isize {
+                    host_mmap::close_handle(handle as host_mmap::Handle);
+                }
+            }
+        }
+    }
+
+    impl Drop for PyMmap {
+        fn drop(&mut self) {
+            self.close_handle();
+        }
+    }
+
+    #[cfg(unix)]
+    #[derive(FromArgs)]
+    #[from_args(legacy, fname = "mmap")]
+    struct MmapNewArgs {
+        #[pyarg(any)]
+        fileno: i32,
+        #[pyarg(any)]
+        length: isize,
+        #[pyarg(any, default = host_mmap::MAP_SHARED)]
+        flags: core::ffi::c_int,
+        #[pyarg(any, default = host_mmap::PROT_WRITE | host_mmap::PROT_READ)]
+        prot: core::ffi::c_int,
+        #[pyarg(any, default = AccessArg::DEFAULT)]
+        access: AccessArg,
+        #[pyarg(any, default)]
+        offset: i64,
+        #[pyarg(named, default = ArgIntoBool::TRUE)]
+        trackfd: ArgIntoBool,
+    }
+
+    #[cfg(windows)]
+    #[derive(FromArgs)]
+    #[from_args(legacy, fname = "mmap")]
+    struct MmapNewArgs {
+        #[pyarg(any)]
+        fileno: i32,
+        #[pyarg(any)]
+        length: isize,
+        #[pyarg(any, default)]
+        tagname: Option<PyObjectRef>,
+        #[pyarg(any, default = AccessArg::DEFAULT)]
+        access: AccessArg,
+        #[pyarg(any, default)]
+        offset: i64,
+        #[pyarg(named, default = ArgIntoBool::TRUE)]
+        trackfd: ArgIntoBool,
+    }
+
+    impl MmapNewArgs {
+        /// Validate mmap constructor arguments
+        fn validate_new_args(&self, vm: &VirtualMachine) -> PyResult<usize> {
+            if self.length < 0 {
+                return Err(vm.new_overflow_error("memory mapped length must be positive"));
+            }
+            if self.offset < 0 {
+                return Err(vm.new_overflow_error("memory mapped offset must be positive"));
+            }
+            Ok(self.length as usize)
+        }
+    }
+
+    #[derive(FromArgs)]
+    struct ReadArgs {
+        #[pyarg(positional, optional)]
+        n: Option<PyObjectRef>,
+    }
+
+    #[derive(FromArgs)]
+    struct SeekArgs {
+        #[pyarg(positional)]
+        pos: isize,
+        #[pyarg(positional, default)]
+        whence: core::ffi::c_int,
+    }
+
+    #[derive(FromArgs)]
+    pub(super) struct FlushOptions {
+        #[pyarg(positional, default)]
+        offset: isize,
+        #[pyarg(positional, default = -1)]
+        size: isize,
+        #[pyarg(named, default)]
+        flags: core::ffi::c_int,
+    }
+
+    impl FlushOptions {
+        fn values(self, len: usize) -> Option<(usize, usize)> {
+            if self.offset < 0 {
+                return None;
+            }
+            let offset = self.offset as usize;
+            let remaining = len.checked_sub(offset)?;
+
+            let size = match self.size {
+                -1 => remaining,
+                s if s < 0 => return None,
+                s => s as usize,
+            };
+
+            if remaining < size {
+                return None;
+            }
+
+            Some((offset, size))
+        }
+    }
+
+    #[derive(FromArgs)]
+    pub(super) struct FindOptions {
+        #[pyarg(positional)]
+        view: PyObjectRef,
+        #[pyarg(positional, optional)]
+        start: Option<PyObjectRef>,
+        #[pyarg(positional, optional)]
+        end: Option<PyObjectRef>,
+    }
+
+    #[cfg(all(unix, not(target_os = "redox")))]
+    #[derive(FromArgs)]
+    pub(super) struct AdviseOptions {
+        #[pyarg(positional)]
+        option: core::ffi::c_int,
+        // None means 0.
+        #[pyarg(positional, default, py_default = "0")]
+        start: Option<ArgIndex>,
+        #[pyarg(positional, optional)]
+        length: Option<ArgIndex>,
+    }
+
+    #[cfg(all(unix, not(target_os = "redox")))]
+    impl AdviseOptions {
+        fn values(
+            self,
+            len: usize,
+            vm: &VirtualMachine,
+        ) -> PyResult<(core::ffi::c_int, usize, usize)> {
+            let start = self
+                .start
+                .map(|s| {
+                    s.as_ref()
+                        .try_to_primitive::<usize>(vm)
+                        .ok()
+                        .filter(|s| *s < len)
+                        .ok_or_else(|| vm.new_value_error("madvise start out of bounds"))
+                })
+                .transpose()?
+                .unwrap_or(0);
+            let length = self
+                .length
+                .map(|s| {
+                    s.as_ref()
+                        .try_to_primitive::<usize>(vm)
+                        .map_err(|_| vm.new_value_error("madvise length invalid"))
+                })
+                .transpose()?
+                .unwrap_or(len);
+
+            if isize::MAX as usize - start < length {
+                return Err(vm.new_overflow_error("madvise length too large"));
+            }
+
+            let length = if start + length > len {
+                len - start
+            } else {
+                length
+            };
+
+            Ok((self.option, start, length))
+        }
+    }
+
+    impl Constructor for PyMmap {
+        type Args = MmapNewArgs;
+
+        #[cfg(unix)]
+        fn py_new(_cls: &Py<PyType>, args: Self::Args, vm: &VirtualMachine) -> PyResult<Self> {
+            use host_mmap::{MAP_PRIVATE, MAP_SHARED, PROT_READ, PROT_WRITE};
+
+            let mut map_size = args.validate_new_args(vm)?;
+            let MmapNewArgs {
+                fileno: fd,
+                flags,
+                prot,
+                access,
+                offset,
+                trackfd,
+                ..
+            } = args;
+
+            let trackfd = trackfd.into_bool();
+            if (access.0 != AccessMode::Default as i32)
+                && ((flags != MAP_SHARED) || (prot != (PROT_WRITE | PROT_READ)))
+            {
+                return Err(vm.new_value_error("mmap can't specify both access and flags, prot."));
+            }
+
+            let access = access.into_mode(vm)?;
+            // TODO: memmap2 doesn't support mapping with prot and flags right now
+            #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+            let (flags, _prot, access) = match access {
+                AccessMode::Read => (MAP_SHARED, PROT_READ, access),
+                AccessMode::Write => (MAP_SHARED, PROT_READ | PROT_WRITE, access),
+                AccessMode::Copy => (MAP_PRIVATE, PROT_READ | PROT_WRITE, access),
+                AccessMode::Default => {
+                    let access = if (prot & PROT_READ) != 0 && (prot & PROT_WRITE) != 0 {
+                        access
+                    } else if (prot & PROT_WRITE) != 0 {
+                        AccessMode::Write
+                    } else {
+                        AccessMode::Read
+                    };
+                    (flags, prot, access)
+                }
+            };
+
+            vm.audit("mmap.__new__", || (fd, args.length, access as i32, offset))?;
+            let anonymous = fd == -1 || flags & host_mmap::MAP_ANONYMOUS != 0;
+
+            // Inspect the supplied descriptor before acquiring ownership, as
+            // CPython does. Invalid and non-regular fds do not impose file bounds.
+            #[cfg(target_os = "macos")]
+            if fd != -1 {
+                host_mmap::prepare_file_mapping(fd);
+            }
+            if fd != -1
+                && let Some(file_len) = host_mmap::regular_file_len(fd)
+            {
+                if map_size == 0 {
+                    if file_len == 0 {
+                        return Err(vm.new_value_error("cannot mmap an empty file"));
+                    }
+
+                    if offset >= file_len {
+                        return Err(vm.new_value_error("mmap offset is greater than file size"));
+                    }
+
+                    map_size = (file_len - offset)
+                        .try_into()
+                        .map_err(|_| vm.new_value_error("mmap length is too large"))?;
+                } else if offset > file_len || file_len - offset < map_size as i64 {
+                    return Err(vm.new_value_error("mmap length is greater than file size"));
+                }
+            }
+
+            let retained_fd = if fd != -1 && trackfd {
+                Some(host_mmap::duplicate_descriptor(fd).map_err(|err| err.to_pyexception(vm))?)
+            } else {
+                None
+            };
+            let mmap = if anonymous {
+                host_mmap::map_anon(map_size)
+            } else {
+                // Keep an owned tracking fd alive through mmap when requested.
+                // Otherwise use the raw integer directly, without fabricating a
+                // BorrowedFd or creating a transient duplicate that can hit EMFILE.
+                let mapping_fd = retained_fd.as_ref().map_or(fd, |owned| owned.as_raw());
+                host_mmap::map_file(
+                    mapping_fd,
+                    offset,
+                    map_size,
+                    match access {
+                        AccessMode::Default => host_mmap::AccessMode::Default,
+                        AccessMode::Read => host_mmap::AccessMode::Read,
+                        AccessMode::Write => host_mmap::AccessMode::Write,
+                        AccessMode::Copy => host_mmap::AccessMode::Copy,
+                    },
+                )
+            }
+            .map_err(|e| e.to_pyexception(vm))?;
+
+            Ok(Self {
+                closed: AtomicCell::new(false),
+                mmap: PyMutex::new(Some(MmapObj::Mapped(mmap))),
+                #[cfg(target_os = "linux")]
+                anonymous,
+                #[cfg(target_os = "linux")]
+                private: flags & MAP_PRIVATE != 0,
+                fd: AtomicCell::new(retained_fd.map_or(-1, |owned| owned.into_raw())),
+                offset,
+                size: AtomicCell::new(map_size),
+                pos: AtomicCell::new(0),
+                exports: AtomicCell::new(0),
+                access,
+                trackfd,
+            })
+        }
+
+        #[cfg(windows)]
+        fn py_new(_cls: &Py<PyType>, args: Self::Args, vm: &VirtualMachine) -> PyResult<Self> {
+            vm.audit("mmap.__new__", || {
+                (args.fileno, args.length, args.access.0, args.offset)
+            })?;
+            let access = args.access.into_mode(vm)?;
+            let mut map_size = args.validate_new_args(vm)?;
+            let MmapNewArgs {
+                fileno,
+                tagname,
+                access: _,
+                offset,
+                trackfd,
+                ..
+            } = args;
+            let trackfd = trackfd.into_bool();
+
+            // CPython historically accepts both -1 and 0 for anonymous maps.
+            let fh = if fileno != -1 && fileno != 0 {
+                let handle = host_nt::handle_from_fd(fileno);
+                if host_mmap::is_invalid_handle_value(handle as isize) {
+                    return Err(vm.new_os_error(format!("Invalid file descriptor: {fileno}")));
+                }
+                host_mmap::prepare_file_mapping(fileno);
+                handle as host_mmap::Handle
+            } else {
+                host_mmap::INVALID_HANDLE
+            };
+            let retained_handle = if fh != host_mmap::INVALID_HANDLE && trackfd {
+                host_mmap::duplicate_handle(fh).map_err(|err| err.to_pyexception(vm))?
+            } else {
+                host_mmap::INVALID_HANDLE
+            };
+            let fh = if retained_handle != host_mmap::INVALID_HANDLE {
+                retained_handle
+            } else {
+                fh
+            };
+            // From here on Self owns the retained handle, including error paths.
+            let result = Self {
+                closed: AtomicCell::new(false),
+                mmap: PyMutex::new(None),
+                handle: AtomicCell::new(retained_handle as isize),
+                offset,
+                size: AtomicCell::new(map_size),
+                pos: AtomicCell::new(0),
+                exports: AtomicCell::new(0),
+                access,
+                trackfd,
+            };
+            if fh != host_mmap::INVALID_HANDLE && map_size == 0 {
+                let file_len = host_mmap::get_file_len(fh).map_err(|err| err.to_pyexception(vm))?;
+                if file_len == 0 {
+                    return Err(vm.new_value_error("cannot mmap an empty file"));
+                }
+                if offset >= file_len {
+                    return Err(vm.new_value_error("mmap offset is greater than file size"));
+                }
+                if file_len - offset > isize::MAX as i64 {
+                    return Err(vm.new_value_error("mmap length is too large"));
+                }
+                map_size = (file_len - offset) as usize;
+                result.size.store(map_size);
+            }
+            let tag_str: Option<String> = match tagname {
+                Some(ref obj) if !vm.is_none(obj) => {
+                    let s = obj.try_to_value::<String>(vm).map_err(|_| {
+                        vm.new_type_error(format!(
+                            "expected str or None for 'tagname', not {}",
+                            obj.class().slot_name()
+                        ))
+                    })?;
+                    if memchr(b'\0', s.as_bytes()).is_some() {
+                        cold_path();
+                        return Err(exceptions::nul_char_error(vm));
+                    }
+                    Some(s)
+                }
+                _ => None,
+            };
+            // Let CreateFileMapping extend files, enforcing the requested access
+            // itself. Named and anonymous maps share exactly the same Win32 path.
+            let mapping = host_mmap::create_mapping(
+                fh,
+                tag_str.as_deref(),
+                match access {
+                    AccessMode::Default => host_mmap::AccessMode::Default,
+                    AccessMode::Read => host_mmap::AccessMode::Read,
+                    AccessMode::Write => host_mmap::AccessMode::Write,
+                    AccessMode::Copy => host_mmap::AccessMode::Copy,
+                },
+                offset,
+                map_size,
+            )
+            .map_err(|err| err.to_pyexception(vm))?;
+            *result.mmap.lock() = Some(MmapObj::Windows(mapping));
+            Ok(result)
+        }
+    }
+
+    static BUFFER_METHODS: BufferMethods = BufferMethods {
+        obj_bytes: |buffer| buffer.obj_as::<PyMmap>().as_bytes(),
+        obj_bytes_mut: |buffer| buffer.obj_as::<PyMmap>().as_bytes_mut(),
+        release: |buffer| {
+            buffer.obj_as::<PyMmap>().exports.fetch_sub(1);
+        },
+        retain: |buffer| {
+            buffer.obj_as::<PyMmap>().exports.fetch_add(1);
+        },
+    };
+
+    impl AsBuffer for PyMmap {
+        const RELEASE_BUFFER: bool = true;
+
+        fn as_buffer(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyBuffer> {
+            // Publish the export while close/resize cannot invalidate the mapping.
+            let _mmap = zelf.check_valid(vm)?;
+            let readonly = matches!(zelf.access, AccessMode::Read);
+            let buf = PyBuffer::new(
+                zelf.to_owned().into(),
+                BufferDescriptor::simple(zelf.__len__(), readonly),
+                &BUFFER_METHODS,
+            );
+
+            Ok(buf)
+        }
+    }
+
+    impl AsMapping for PyMmap {
+        fn as_mapping() -> &'static PyMappingMethods {
+            static AS_MAPPING: PyMappingMethods = PyMappingMethods {
+                length: atomic_func!(
+                    |mapping, _vm| Ok(PyMmap::mapping_downcast(mapping).__len__())
+                ),
+                subscript: atomic_func!(|mapping, needle, vm| {
+                    PyMmap::mapping_downcast(mapping).getitem_inner(needle, vm)
+                }),
+                ass_subscript: atomic_func!(|mapping, needle, value, vm| {
+                    let zelf = PyMmap::mapping_downcast(mapping);
+                    if let Some(value) = value {
+                        PyMmap::setitem_inner(zelf, needle, &value, vm)
+                    } else {
+                        Err(vm
+                            .new_type_error("mmap object doesn't support item deletion".to_owned()))
+                    }
+                }),
+            };
+            &AS_MAPPING
+        }
+    }
+
+    impl AsSequence for PyMmap {
+        fn as_sequence() -> &'static PySequenceMethods {
+            use rustpython_common::lock::LazyLock;
+            static AS_SEQUENCE: LazyLock<PySequenceMethods> = LazyLock::new(|| PySequenceMethods {
+                length: atomic_func!(|seq, _vm| Ok(PyMmap::sequence_downcast(seq).__len__())),
+                item: atomic_func!(|seq, i, vm| {
+                    let zelf = PyMmap::sequence_downcast(seq);
+                    let mmap = zelf.check_valid(vm)?;
+                    let byte = usize::try_from(i)
+                        .ok()
+                        .and_then(|i| mmap.as_ref().unwrap().as_slice().get(i))
+                        .copied()
+                        .ok_or_else(|| vm.new_index_error("mmap index out of range"))?;
+                    Ok(PyBytes::from(vec![byte]).into_ref(&vm.ctx).into())
+                }),
+                ass_item: atomic_func!(|seq, i, value, vm| {
+                    let zelf = PyMmap::sequence_downcast(seq);
+                    if let Some(value) = value {
+                        PyMmap::setitem_by_index(zelf, i, &value, vm)
+                    } else {
+                        Err(vm
+                            .new_type_error("mmap object doesn't support item deletion".to_owned()))
+                    }
+                }),
+                ..PySequenceMethods::NOT_IMPLEMENTED
+            });
+            &AS_SEQUENCE
+        }
+    }
+
+    #[pyclass(
+        with(Constructor, AsMapping, AsSequence, AsBuffer, Representable),
+        flags(BASETYPE, HAS_WEAKREF)
+    )]
+    impl PyMmap {
+        fn as_bytes_mut(&self) -> BorrowedValueMut<'_, [u8]> {
+            PyMutexGuard::map(self.mmap.lock(), |m| {
+                match m.as_mut().expect("mmap closed or invalid") {
+                    #[cfg(unix)]
+                    MmapObj::Mapped(mmap) => mmap.as_mut_slice(),
+                    #[cfg(windows)]
+                    MmapObj::Windows(named) => named.as_mut_slice(),
+                }
+            })
+            .into()
+        }
+
+        fn as_bytes(&self) -> BorrowedValue<'_, [u8]> {
+            PyMutexGuard::map_immutable(self.mmap.lock(), |m| {
+                m.as_ref().expect("mmap closed or invalid").as_slice()
+            })
+            .into()
+        }
+
+        fn __len__(&self) -> usize {
+            self.size.load()
+        }
+
+        #[inline]
+        fn pos(&self) -> usize {
+            self.pos.load()
+        }
+
+        #[inline]
+        fn advance_pos(&self, step: usize) {
+            self.pos.store(self.pos() + step);
+        }
+
+        #[inline]
+        fn try_writable<R>(
+            &self,
+            vm: &VirtualMachine,
+            f: impl FnOnce(&mut [u8]) -> R,
+        ) -> PyResult<R> {
+            if matches!(self.access, AccessMode::Read) {
+                return Err(vm.new_type_error("mmap can't modify a readonly memory map."));
+            }
+
+            match self.check_valid(vm)?.deref_mut().as_mut().unwrap() {
+                #[cfg(unix)]
+                MmapObj::Mapped(mmap) => Ok(f(mmap.as_mut_slice())),
+                #[cfg(windows)]
+                MmapObj::Windows(named) => Ok(f(named.as_mut_slice())),
+            }
+        }
+
+        fn check_valid(&self, vm: &VirtualMachine) -> PyResult<PyMutexGuard<'_, Option<MmapObj>>> {
+            let m = self.mmap.lock();
+
+            if m.is_none() {
+                drop(m);
+                return Err(vm.new_value_error("mmap closed or invalid"));
+            }
+
+            Ok(m)
+        }
+
+        #[cfg(any(target_os = "linux", windows, all(test, feature = "threading")))]
+        fn check_resizeable(
+            &self,
+            vm: &VirtualMachine,
+        ) -> PyResult<PyMutexGuard<'_, Option<MmapObj>>> {
+            // Borrowed buffers can hold the data lock across blocking I/O.
+            if self.exports.load() > 0 {
+                return Err(vm.new_buffer_error("mmap can't resize with extant buffers exported."));
+            }
+            let mmap = self.check_valid(vm)?;
+            if self.exports.load() > 0 {
+                drop(mmap);
+                return Err(vm.new_buffer_error("mmap can't resize with extant buffers exported."));
+            }
+
+            if !self.trackfd {
+                drop(mmap);
+                return Err(vm.new_value_error("mmap can't resize with trackfd=False."));
+            }
+
+            if self.access == AccessMode::Write || self.access == AccessMode::Default {
+                return Ok(mmap);
+            }
+
+            drop(mmap);
+            Err(vm.new_type_error("mmap can't resize a readonly or copy-on-write memory map."))
+        }
+
+        #[pygetset]
+        fn closed(zelf: &Py<Self>) -> bool {
+            zelf.closed.load()
+        }
+
+        #[pymethod]
+        fn close(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<()> {
+            // Reject an existing export without waiting for its borrowed-data guard.
+            if zelf.exports.load() > 0 {
+                return Err(vm.new_buffer_error("cannot close exported pointers exist."));
+            }
+            let mut mmap = zelf.mmap.lock();
+            if zelf.exports.load() > 0 {
+                drop(mmap);
+                return Err(vm.new_buffer_error("cannot close exported pointers exist."));
+            }
+
+            zelf.closed.store(true);
+            *mmap = None;
+
+            zelf.close_handle();
+
+            Ok(())
+        }
+
+        fn get_find_range(
+            &self,
+            initial_pos: usize,
+            initial_size: usize,
+            start: Option<isize>,
+            end: Option<isize>,
+        ) -> (usize, usize) {
+            let size = self.__len__();
+            let start = start.map_or_else(
+                || initial_pos,
+                |start| {
+                    if start < 0 {
+                        start.saturated_at(size)
+                    } else {
+                        start as usize
+                    }
+                },
+            );
+            let end = end.map_or_else(|| initial_size.min(size), |end| end.saturated_at(size));
+            (start, end)
+        }
+
+        fn find_inner(
+            &self,
+            options: FindOptions,
+            reverse: bool,
+            vm: &VirtualMachine,
+        ) -> PyResult<PyInt> {
+            // Bind the positional arguments before acquiring the buffer, as
+            // Clinic does. The buffer can call Python and close the mapping.
+            let view = ArgBytesLike::try_from_borrowed_object(vm, &options.view)?;
+            let mmap = self.check_valid(vm)?;
+            let initial_pos = self.pos();
+            let initial_size = self.__len__();
+            drop(mmap);
+
+            let start = options
+                .start
+                .as_ref()
+                .map(|value| isize::try_from_borrowed_object(vm, value))
+                .transpose()?;
+            let end = if start.is_some() {
+                options
+                    .end
+                    .as_ref()
+                    .map(|value| isize::try_from_borrowed_object(vm, value))
+                    .transpose()?
+            } else {
+                None
+            };
+            // Index conversion may have closed the mapping. Do not borrow
+            // search bytes from an exporter before reporting that closure.
+            if self.closed.load() {
+                return Err(vm.new_value_error("mmap closed or invalid"));
+            }
+            // A search view may itself be this mmap (or a view of it). Take
+            // an unlocked snapshot before locking the mapping for the scan.
+            let sub = view.borrow_buf_unlocked(vm)?;
+            let mmap = self.check_valid(vm)?;
+            let (start, end) = self.get_find_range(initial_pos, initial_size, start, end);
+
+            // A reversed range contains nothing, not even the empty subsequence.
+            if start > end {
+                return Ok(PyInt::from(-1isize));
+            }
+
+            // The empty subsequence matches at the edge the scan begins from:
+            // the start of the range going forward, the end going backward.
+            if sub.is_empty() {
+                let pos = if reverse { end } else { start };
+                return Ok(PyInt::from(pos as isize));
+            }
+
+            let buf = &mmap.as_ref().unwrap().as_slice()[start..end];
+            let mut windows = buf.windows(sub.len());
+            let pos = if reverse {
+                windows.rposition(|window| window == &*sub)
+            } else {
+                windows.position(|window| window == &*sub)
+            };
+
+            Ok(pos.map_or_else(|| PyInt::from(-1isize), |i| PyInt::from(start + i)))
+        }
+
+        #[pymethod]
+        fn find(zelf: &Py<Self>, options: FindOptions, vm: &VirtualMachine) -> PyResult<PyInt> {
+            zelf.find_inner(options, false, vm)
+        }
+
+        #[pymethod]
+        fn rfind(zelf: &Py<Self>, options: FindOptions, vm: &VirtualMachine) -> PyResult<PyInt> {
+            zelf.find_inner(options, true, vm)
+        }
+
+        #[pymethod]
+        fn flush(zelf: &Py<Self>, options: FlushOptions, vm: &VirtualMachine) -> PyResult<()> {
+            let mmap = zelf.check_valid(vm)?;
+            let flags = options.flags;
+            let (offset, size) = options
+                .values(zelf.__len__())
+                .ok_or_else(|| vm.new_value_error("flush values out of range"))?;
+
+            if zelf.access == AccessMode::Read || zelf.access == AccessMode::Copy {
+                return Ok(());
+            }
+
+            match mmap.deref().as_ref().unwrap() {
+                #[cfg(unix)]
+                MmapObj::Mapped(mmap) => {
+                    mmap.flush_range(offset, size, flags)
+                        .map_err(|e| e.to_pyexception(vm))?;
+                }
+                #[cfg(windows)]
+                MmapObj::Windows(named) => {
+                    let _ = flags;
+                    named
+                        .flush_range(offset, size)
+                        .map_err(|e| e.to_pyexception(vm))?;
+                }
+            }
+
+            Ok(())
+        }
+
+        #[pymethod]
+        fn set_name(zelf: &Py<Self>, name: PyUtf8StrRef, vm: &VirtualMachine) -> PyResult<()> {
+            let name =
+                alloc::ffi::CString::new(name.as_str()).map_err(|err| err.to_pyexception(vm))?;
+            #[cfg(target_os = "linux")]
+            {
+                const PREFIX: &str = "cpython:mmap:";
+                if name.as_bytes().len() > 79 - PREFIX.len() {
+                    return Err(vm.new_value_error("name is too long"));
+                }
+                if !zelf.anonymous {
+                    return Err(
+                        vm.new_value_error("Cannot set annotation on non-anonymous mappings")
+                    );
+                }
+                // As in CPython's release build, kernel annotations are enabled
+                // only in development mode.
+                if vm.state.config.settings.dev_mode {
+                    let annotation =
+                        alloc::ffi::CString::new([PREFIX.as_bytes(), name.as_bytes()].concat())
+                            .expect("the name was checked for embedded NUL characters");
+                    let mmap = zelf.mmap.lock();
+                    let address = mmap
+                        .as_ref()
+                        .map_or(0, |mapping| mapping.as_slice().as_ptr() as usize);
+                    host_mmap::set_mapping_name(address, zelf.__len__(), &annotation)
+                        .map_err(|err| err.to_pyexception(vm))?;
+                }
+                Ok(())
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (zelf, name);
+                Err(vm.new_not_implemented_error(
+                    "Annotation of mmap is not supported on this platform",
+                ))
+            }
+        }
+
+        #[cfg(all(unix, not(target_os = "redox")))]
+        #[pymethod]
+        fn madvise(zelf: &Py<Self>, options: AdviseOptions, vm: &VirtualMachine) -> PyResult<()> {
+            let guard = zelf.check_valid(vm)?;
+            let (option, start, length) = options.values(zelf.__len__(), vm)?;
+            if !host_mmap::validate_advice(option) {
+                return Err(vm.new_value_error("Not a valid Advice value"));
+            }
+
+            let mmap = guard.deref().as_ref().unwrap();
+            match mmap {
+                MmapObj::Mapped(m) => m.madvise_range(start, length, option),
+                #[cfg(windows)]
+                MmapObj::Windows(_) => unreachable!("unix-only method"),
+            }
+            .map_err(|e| e.to_pyexception(vm))?;
+
+            Ok(())
+        }
+
+        #[pymethod(name = "move")]
+        fn move_(
+            zelf: &Py<Self>,
+            dest: ArgIndex,
+            src: ArgIndex,
+            count: ArgIndex,
+            vm: &VirtualMachine,
+        ) -> PyResult<()> {
+            fn args(
+                dest: &Py<PyInt>,
+                src: &Py<PyInt>,
+                count: &Py<PyInt>,
+                size: usize,
+                vm: &VirtualMachine,
+            ) -> Option<(usize, usize, usize)> {
+                if dest.as_bigint().is_negative()
+                    || src.as_bigint().is_negative()
+                    || count.as_bigint().is_negative()
+                {
+                    return None;
+                }
+                let dest = dest.try_to_primitive(vm).ok()?;
+                let src = src.try_to_primitive(vm).ok()?;
+                let cnt = count.try_to_primitive(vm).ok()?;
+                if dest > size || src > size || size - dest < cnt || size - src < cnt {
+                    return None;
+                }
+                Some((dest, src, cnt))
+            }
+
+            zelf.try_writable(vm, |mmap| {
+                let (dest, src, cnt) =
+                    args(dest.as_ref(), src.as_ref(), count.as_ref(), mmap.len(), vm).ok_or_else(
+                        || vm.new_value_error("source, destination, or count out of range"),
+                    )?;
+                let dest_end = dest + cnt;
+                let src_end = src + cnt;
+                let src_buf = mmap[src..src_end].to_vec();
+                (&mut mmap[dest..dest_end])
+                    .write(&src_buf)
+                    .map_err(|e| e.to_pyexception(vm))?;
+                Ok(())
+            })?
+        }
+
+        #[pymethod]
+        fn read(zelf: &Py<Self>, args: ReadArgs, vm: &VirtualMachine) -> PyResult<PyBytesRef> {
+            let num_bytes = match args.n {
+                Some(obj) if !vm.is_none(&obj) => {
+                    let index = obj.try_index_opt(vm).ok_or_else(|| {
+                        let class = obj.class();
+                        let name = class.slot_name();
+                        let name = &name[..name.floor_char_boundary(200)];
+                        vm.new_type_error(format!(
+                            "argument should be integer or None, not '{name}'"
+                        ))
+                    })??;
+                    Some(index.try_to_primitive::<isize>(vm)?)
+                }
+                _ => None,
+            };
+            let mmap = zelf.check_valid(vm)?;
+            let pos = zelf.pos();
+            let remaining = zelf.__len__().saturating_sub(pos);
+            let num_bytes = num_bytes
+                .filter(|&n| n >= 0 && (n as usize) <= remaining)
+                .map_or(remaining, |n| n as usize);
+
+            if num_bytes == 0 {
+                return Ok(PyBytes::from(vec![]).into_ref(&vm.ctx));
+            }
+            let end_pos = pos + num_bytes;
+            let bytes = mmap.deref().as_ref().unwrap().as_slice()[pos..end_pos].to_vec();
+
+            let result = PyBytes::from(bytes).into_ref(&vm.ctx);
+
+            zelf.advance_pos(num_bytes);
+
+            Ok(result)
+        }
+
+        #[pymethod]
+        fn read_byte(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyIntRef> {
+            let mmap = zelf.check_valid(vm)?;
+            let pos = zelf.pos();
+            if pos >= zelf.__len__() {
+                return Err(vm.new_value_error("read byte out of range"));
+            }
+
+            let b = mmap.deref().as_ref().unwrap().as_slice()[pos];
+
+            zelf.advance_pos(1);
+
+            Ok(PyInt::from(b).into_ref(&vm.ctx))
+        }
+
+        #[pymethod]
+        fn readline(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyBytesRef> {
+            let mmap = zelf.check_valid(vm)?;
+            let pos = zelf.pos();
+
+            let remaining = zelf.__len__().saturating_sub(pos);
+            if remaining == 0 {
+                return Ok(PyBytes::from(vec![]).into_ref(&vm.ctx));
+            }
+
+            let slice = mmap.as_ref().unwrap().as_slice();
+            let eof = slice[pos..].iter().position(|&x| x == b'\n');
+
+            let end_pos = if let Some(i) = eof {
+                pos + i + 1
+            } else {
+                zelf.__len__()
+            };
+
+            let bytes = slice[pos..end_pos].to_vec();
+
+            let result = PyBytes::from(bytes).into_ref(&vm.ctx);
+
+            zelf.advance_pos(end_pos - pos);
+
+            Ok(result)
+        }
+
+        #[cfg(target_os = "linux")]
+        #[pymethod]
+        fn resize(zelf: &Py<Self>, newsize: ArgIndex, vm: &VirtualMachine) -> PyResult<()> {
+            let newsize: isize = newsize.as_ref().try_to_primitive(vm).map_err(|_| {
+                vm.new_overflow_error("Python int too large to convert to C ssize_t")
+            })?;
+            // Reject exports before taking the data lock, and retain the guard
+            // through truncation and remapping so a new export cannot race us.
+            let mut mmap = zelf.check_resizeable(vm)?;
+            let file_size = i128::from(zelf.offset) + newsize as i128;
+            if newsize < 0 || file_size > isize::MAX as i128 {
+                return Err(vm.new_value_error("new size out of range"));
+            }
+            let newsize = newsize as usize;
+            if zelf.anonymous && !zelf.private && newsize > zelf.__len__() {
+                return Err(vm.new_value_error("mmap: can't expand a shared anonymous mapping"));
+            }
+            let fd = zelf.fd.load();
+            if fd != -1 {
+                let fd = unsafe { crt_fd::Borrowed::try_borrow_raw(fd) }
+                    .map_err(|err| err.to_pyexception(vm))?;
+                let file_size = file_size
+                    .try_into()
+                    .map_err(|_| vm.new_value_error("new size out of range"))?;
+                crt_fd::ftruncate(fd, file_size).map_err(|err| err.to_pyexception(vm))?;
+            }
+            let MmapObj::Mapped(mapping) = mmap.as_mut().unwrap();
+            // The mapping is locked, exported buffers are prohibited, and its
+            // backing file has already been resized to cover the new mapping.
+            unsafe { mapping.remap(newsize) }.map_err(|err| err.to_pyexception(vm))?;
+            zelf.size.store(newsize);
+            Ok(())
+        }
+
+        #[cfg(windows)]
+        #[pymethod]
+        fn resize(zelf: &Py<Self>, newsize: ArgIndex, vm: &VirtualMachine) -> PyResult<()> {
+            let newsize: isize = newsize.as_ref().try_to_primitive(vm).map_err(|_| {
+                vm.new_overflow_error("Python int too large to convert to C ssize_t")
+            })?;
+            let mut mmap = zelf.check_resizeable(vm)?;
+            let file_size = i128::from(zelf.offset) + newsize as i128;
+            if newsize < 0 || file_size > isize::MAX as i128 {
+                return Err(vm.new_value_error("new size out of range"));
+            }
+            let MmapObj::Windows(mapping) = mmap.as_mut().unwrap();
+            // The lock and export check keep all pointers private during remapping.
+            let result = unsafe {
+                mapping.resize(
+                    zelf.handle.load() as host_mmap::Handle,
+                    zelf.offset,
+                    newsize as usize,
+                )
+            };
+            if mapping.is_valid() {
+                zelf.size.store(mapping.size());
+            } else {
+                *mmap = None;
+                zelf.closed.store(true);
+            }
+            result.map_err(|err| err.to_pyexception(vm))
+        }
+
+        #[pymethod]
+        fn seek(zelf: &Py<Self>, args: SeekArgs, vm: &VirtualMachine) -> PyResult<usize> {
+            let dist = args.pos;
+            let how = args.whence;
+            let _mmap = zelf.check_valid(vm)?;
+            let size = zelf.__len__();
+
+            let new_pos = match how {
+                0 => dist, // relative to start
+                1 => {
+                    // relative to current position
+                    let pos = zelf.pos();
+                    if (((isize::MAX as usize) - pos) as isize) < dist {
+                        return Err(vm.new_value_error("seek out of range"));
+                    }
+                    pos as isize + dist
+                }
+                2 => {
+                    // relative to end
+                    if (((isize::MAX as usize) - size) as isize) < dist {
+                        return Err(vm.new_value_error("seek out of range"));
+                    }
+                    size as isize + dist
+                }
+                _ => return Err(vm.new_value_error("unknown seek type")),
+            };
+
+            if new_pos < 0 || (new_pos as usize) > size {
+                return Err(vm.new_value_error("seek out of range"));
+            }
+
+            zelf.pos.store(new_pos as usize);
+
+            Ok(new_pos as usize)
+        }
+
+        #[cfg(unix)]
+        #[pymethod]
+        fn size(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyIntRef> {
+            let _mmap = zelf.check_valid(vm)?;
+            if !zelf.trackfd {
+                return Err(vm.new_value_error("can't get size with trackfd=False"));
+            }
+            let fd = zelf.fd.load();
+            if fd == -1 {
+                return Ok(PyInt::from(zelf.__len__()).into_ref(&vm.ctx));
+            }
+            let fd = unsafe { crt_fd::Borrowed::try_borrow_raw(fd) }
+                .map_err(|err| err.to_pyexception(vm))?;
+            let file_len = host_mmap::file_len(fd).map_err(|err| err.to_pyexception(vm))?;
+            Ok(PyInt::from(file_len).into_ref(&vm.ctx))
+        }
+
+        #[cfg(windows)]
+        #[pymethod]
+        fn size(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyIntRef> {
+            let _mmap = zelf.check_valid(vm)?;
+            if !zelf.trackfd {
+                return Err(vm.new_value_error("can't get size with trackfd=False"));
+            }
+            let handle = zelf.handle.load();
+            if host_mmap::is_invalid_handle_value(handle) {
+                // Anonymous mapping, return the mmap size
+                return Ok(PyInt::from(zelf.__len__()).into_ref(&vm.ctx));
+            }
+
+            let file_len = host_mmap::get_file_len(handle as host_mmap::Handle)
+                .map_err(|e| e.to_pyexception(vm))?;
+            Ok(PyInt::from(file_len).into_ref(&vm.ctx))
+        }
+
+        #[pymethod]
+        fn tell(zelf: &Py<Self>) -> usize {
+            zelf.pos()
+        }
+
+        #[pymethod]
+        fn seekable(_zelf: &Py<Self>) -> bool {
+            true
+        }
+
+        #[pymethod]
+        fn write(zelf: &Py<Self>, bytes: ArgBytesLike, vm: &VirtualMachine) -> PyResult<PyIntRef> {
+            let self_ = &**zelf;
+
+            // Writing locks the map, and reading a source that views this same
+            // map locks it too, so such a source is copied out first.
+            let copied;
+            let borrowed;
+            let data: &[u8] = if bytes.source_object().is(zelf.as_object()) {
+                copied = bytes.borrow_buf().to_vec();
+                &copied
+            } else {
+                borrowed = bytes.borrow_buf();
+                &borrowed
+            };
+
+            let len = self_.try_writable(vm, |mmap| {
+                let pos = self_.pos();
+                if pos > mmap.len() || mmap.len() - pos < data.len() {
+                    return Err(vm.new_value_error("data out of range"));
+                }
+                (&mut mmap[pos..(pos + data.len())])
+                    .write(data)
+                    .map_err(|err| err.to_pyexception(vm))?;
+                self_.advance_pos(data.len());
+                Ok(data.len())
+            })??;
+
+            Ok(PyInt::from(len).into_ref(&vm.ctx))
+        }
+
+        #[pymethod]
+        fn write_byte(zelf: &Py<Self>, byte: PyObjectRef, vm: &VirtualMachine) -> PyResult<()> {
+            let b = value_from_object(vm, &byte)?;
+
+            zelf.try_writable(vm, |mmap| {
+                let pos = zelf.pos();
+                if pos >= mmap.len() {
+                    return Err(vm.new_value_error("write byte out of range"));
+                }
+                mmap[pos] = b;
+                zelf.advance_pos(1);
+                Ok(())
+            })??;
+
+            Ok(())
+        }
+
+        fn __getitem__(&self, needle: &PyObject, vm: &VirtualMachine) -> PyResult<PyObjectRef> {
+            self.getitem_inner(needle, vm)
+        }
+
+        fn __setitem__(
+            zelf: &Py<Self>,
+            needle: &PyObject,
+            value: PyObjectRef,
+            vm: &VirtualMachine,
+        ) -> PyResult<()> {
+            Self::setitem_inner(zelf, needle, &value, vm)
+        }
+
+        #[pymethod]
+        fn __enter__(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
+            let _m = zelf.check_valid(vm)?;
+            Ok(zelf.to_owned())
+        }
+
+        #[pymethod]
+        fn __exit__(
+            zelf: &Py<Self>,
+            _exc_type: PyObjectRef,
+            _exc_value: PyObjectRef,
+            _traceback: PyObjectRef,
+            vm: &VirtualMachine,
+        ) -> PyResult<()> {
+            Self::close(zelf, vm)
+        }
+
+        #[cfg(windows)]
+        #[pymethod]
+        fn __sizeof__(_zelf: &Py<Self>) -> usize {
+            core::mem::size_of::<Self>()
+        }
+    }
+
+    impl PyMmap {
+        fn getitem_by_index(&self, i: isize, vm: &VirtualMachine) -> PyResult<PyObjectRef> {
+            let mmap = self.check_valid(vm)?;
+            let i = i
+                .wrapped_at(self.__len__())
+                .ok_or_else(|| vm.new_index_error("mmap index out of range"))?;
+
+            let b = mmap.deref().as_ref().unwrap().as_slice()[i];
+
+            Ok(PyInt::from(b).into_ref(&vm.ctx).into())
+        }
+
+        fn getitem_by_slice(
+            &self,
+            slice: &SaturatedSlice,
+            vm: &VirtualMachine,
+        ) -> PyResult<PyObjectRef> {
+            let mmap = self.check_valid(vm)?;
+            let (range, step, slice_len) = slice.adjust_indices(self.__len__());
+            let slice_data = mmap.deref().as_ref().unwrap().as_slice();
+
+            if slice_len == 0 {
+                return Ok(PyBytes::from(vec![]).into_ref(&vm.ctx).into());
+            } else if step == 1 {
+                return Ok(PyBytes::from(slice_data[range].to_vec())
+                    .into_ref(&vm.ctx)
+                    .into());
+            }
+
+            let mut result_buf = Vec::with_capacity(slice_len);
+            if step.is_negative() {
+                for i in range.rev().step_by(step.unsigned_abs()) {
+                    result_buf.push(slice_data[i]);
+                }
+            } else {
+                for i in range.step_by(step.unsigned_abs()) {
+                    result_buf.push(slice_data[i]);
+                }
+            }
+            Ok(PyBytes::from(result_buf).into_ref(&vm.ctx).into())
+        }
+
+        fn getitem_inner(&self, needle: &PyObject, vm: &VirtualMachine) -> PyResult<PyObjectRef> {
+            match SequenceIndex::try_from_borrowed_object::<NameMmap>(vm, needle)? {
+                SequenceIndex::Int(i) => self.getitem_by_index(i, vm),
+                SequenceIndex::Slice(slice) => self.getitem_by_slice(&slice, vm),
+            }
+        }
+
+        fn setitem_inner(
+            zelf: &Py<Self>,
+            needle: &PyObject,
+            value: &PyObject,
+            vm: &VirtualMachine,
+        ) -> PyResult<()> {
+            match SequenceIndex::try_from_borrowed_object::<NameMmap>(vm, needle)? {
+                SequenceIndex::Int(i) => Self::setitem_by_index(zelf, i, value, vm),
+                SequenceIndex::Slice(slice) => Self::setitem_by_slice(zelf, &slice, value, vm),
+            }
+        }
+
+        fn setitem_by_index(
+            &self,
+            i: isize,
+            value: &PyObject,
+            vm: &VirtualMachine,
+        ) -> PyResult<()> {
+            let b = value_from_object(vm, value)?;
+
+            self.try_writable(vm, |mmap| {
+                let i = i
+                    .wrapped_at(mmap.len())
+                    .ok_or_else(|| vm.new_index_error("mmap index out of range"))?;
+                mmap[i] = b;
+                Ok(())
+            })?
+        }
+
+        fn setitem_by_slice(
+            &self,
+            slice: &SaturatedSlice,
+            value: &PyObject,
+            vm: &VirtualMachine,
+        ) -> PyResult<()> {
+            let bytes = bytes_from_object(vm, value)?;
+
+            self.try_writable(vm, |mmap| {
+                let (range, step, slice_len) = slice.adjust_indices(mmap.len());
+
+                if bytes.len() != slice_len {
+                    return Err(vm.new_index_error("mmap slice assignment is wrong size"));
+                }
+
+                if slice_len == 0 {
+                    // do nothing
+                } else if step == 1 {
+                    (&mut mmap[range])
+                        .write(&bytes)
+                        .map_err(|err| err.to_pyexception(vm))?;
+                } else {
+                    let mut bi = 0; // bytes index
+                    if step.is_negative() {
+                        for i in range.rev().step_by(step.unsigned_abs()) {
+                            mmap[i] = bytes[bi];
+                            bi += 1;
+                        }
+                    } else {
+                        for i in range.step_by(step.unsigned_abs()) {
+                            mmap[i] = bytes[bi];
+                            bi += 1;
+                        }
+                    }
+                }
+                Ok(())
+            })?
+        }
+    }
+
+    #[cfg(test)]
+    #[cfg(feature = "threading")]
+    mod tests {
+        use super::*;
+        use core::time::Duration;
+        use std::{sync::mpsc, thread};
+
+        fn rejects_borrowed_buffer(resize: bool) {
+            let builder = crate::vm::Interpreter::builder(Default::default());
+            let defs = crate::stdlib_module_defs(&builder.ctx);
+            let interp = builder
+                .add_native_modules(&defs)
+                .add_frozen_modules(rustpython_pylib::FROZEN_STDLIB)
+                .build();
+            interp.enter(|vm| {
+                let module = vm.import("mmap", 0).unwrap();
+                let mapped = module
+                    .get_attr("mmap", vm)
+                    .unwrap()
+                    .call((-1, 1), vm)
+                    .unwrap()
+                    .downcast::<PyMmap>()
+                    .unwrap();
+                let buffer = PyMmap::as_buffer(&mapped, vm).unwrap();
+                thread::scope(|scope| {
+                    let (ready_tx, ready_rx) = mpsc::channel();
+                    let (done_tx, done_rx) = mpsc::channel();
+                    let buffer = &buffer;
+                    let borrower = scope.spawn(move || {
+                        // A native I/O operation can keep this guard while detached.
+                        let bytes = buffer.as_contiguous().unwrap();
+                        assert!(bytes.is_locked());
+                        ready_tx.send(()).unwrap();
+                        // Release even on a regression, so the test fails rather than hangs.
+                        let rejected_before_release =
+                            done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+                        drop(bytes);
+                        rejected_before_release
+                    });
+                    ready_rx.recv().unwrap();
+                    let result = if resize {
+                        mapped.check_resizeable(vm).map(drop)
+                    } else {
+                        PyMmap::close(&mapped, vm)
+                    };
+                    let _ = done_tx.send(());
+                    assert!(
+                        borrower.join().unwrap(),
+                        "export rejection waited for the borrowed buffer"
+                    );
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .class()
+                            .is(vm.ctx.exceptions.buffer_error)
+                    );
+                });
+                drop(buffer);
+                PyMmap::close(&mapped, vm).unwrap();
+            });
+        }
+
+        #[test]
+        fn close_rejects_borrowed_buffer() {
+            rejects_borrowed_buffer(false);
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn untracked_mapping_cannot_resize() {
+            crate::vm::Interpreter::without_stdlib(Default::default()).enter(|vm| {
+                let mapped = PyMmap::py_new(
+                    vm.ctx.types.type_type,
+                    MmapNewArgs {
+                        fileno: -1,
+                        length: 64,
+                        tagname: None,
+                        access: AccessArg::DEFAULT,
+                        offset: 0,
+                        trackfd: ArgIntoBool::FALSE,
+                    },
+                    vm,
+                )
+                .unwrap();
+                assert_eq!(mapped.__len__(), 64);
+                assert!(!mapped.trackfd);
+                assert!(mapped.check_resizeable(vm).is_err());
+            });
+        }
+
+        #[test]
+        fn resize_rejects_borrowed_buffer() {
+            rejects_borrowed_buffer(true);
+        }
+    }
+
+    impl Representable for PyMmap {
+        #[inline]
+        fn repr_str(zelf: &Py<Self>, _vm: &VirtualMachine) -> PyResult<String> {
+            let mmap = zelf.mmap.lock();
+
+            if mmap.is_none() {
+                return Ok("<mmap.mmap closed=True>".to_owned());
+            }
+
+            let access_str = match zelf.access {
+                AccessMode::Default => "ACCESS_DEFAULT",
+                AccessMode::Read => "ACCESS_READ",
+                AccessMode::Write => "ACCESS_WRITE",
+                AccessMode::Copy => "ACCESS_COPY",
+            };
+
+            let repr = format!(
+                "<mmap.mmap closed=False, access={}, length={}, pos={}, offset={}>",
+                access_str,
+                zelf.__len__(),
+                zelf.pos(),
+                zelf.offset
+            );
+
+            Ok(repr)
+        }
+    }
+}

@@ -1,0 +1,1364 @@
+use crate::metadata::{NestedMeta, PunctuatedNestedMeta, nested_meta};
+use itertools::Itertools;
+use proc_macro2::{Span, TokenStream};
+use quote::{ToTokens, quote};
+use std::collections::{HashMap, HashSet};
+use syn::Meta;
+use syn::visit::Visit;
+use syn::visit_mut::VisitMut;
+use syn::{
+    Attribute, FnArg, Ident, Result, Signature, Type, UseTree, ext::IdentExt, spanned::Spanned,
+};
+
+pub(crate) const ALL_ALLOWED_NAMES: &[&str] = &[
+    "pymethod",
+    "pyclassmethod",
+    "pystaticmethod",
+    "pygetset",
+    "pyfunction",
+    "pyclass",
+    "pyexception",
+    "pystruct_sequence",
+    "pyattr",
+    "pyslot",
+    "extend_class",
+    "pymember",
+];
+
+#[derive(Clone)]
+struct NurseryItem {
+    attr_name: Ident,
+    py_names: Vec<String>,
+    cfgs: Vec<Attribute>,
+    tokens: TokenStream,
+    sort_order: usize,
+}
+
+#[derive(Default)]
+pub(crate) struct ItemNursery(Vec<NurseryItem>);
+
+pub(crate) struct ValidatedItemNursery(ItemNursery);
+
+impl ItemNursery {
+    pub(crate) fn add_item(
+        &mut self,
+        attr_name: Ident,
+        py_names: Vec<String>,
+        cfgs: Vec<Attribute>,
+        tokens: TokenStream,
+        sort_order: usize,
+    ) {
+        self.0.push(NurseryItem {
+            attr_name,
+            py_names,
+            cfgs,
+            tokens,
+            sort_order,
+        });
+    }
+
+    pub(crate) fn validate(self) -> Result<ValidatedItemNursery> {
+        let mut by_name: HashSet<(String, Vec<Attribute>)> = HashSet::new();
+        for item in &self.0 {
+            for py_name in &item.py_names {
+                let inserted = by_name.insert((py_name.clone(), item.cfgs.clone()));
+                if !inserted {
+                    return Err(syn::Error::new(
+                        item.attr_name.span(),
+                        format!("Duplicated #[py*] attribute found for {:?}", item.py_names),
+                    ));
+                }
+            }
+        }
+        Ok(ValidatedItemNursery(self))
+    }
+}
+
+impl ToTokens for ValidatedItemNursery {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        let mut sorted = self.0.0.clone();
+        sorted.sort_by_key(|a| a.sort_order);
+        tokens.extend(sorted.iter().map(|item| {
+            let cfgs = &item.cfgs;
+            let tokens = &item.tokens;
+            quote! {
+                #(#cfgs)*
+                {
+                    #tokens
+                }
+            }
+        }))
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ContentItemInner<T> {
+    pub index: usize,
+    pub attr_name: T,
+}
+
+pub(crate) trait ContentItem {
+    type AttrName: core::str::FromStr + core::fmt::Display;
+
+    fn inner(&self) -> &ContentItemInner<Self::AttrName>;
+
+    fn index(&self) -> usize {
+        self.inner().index
+    }
+
+    fn attr_name(&self) -> &Self::AttrName {
+        &self.inner().attr_name
+    }
+
+    fn new_syn_error(&self, span: Span, message: &str) -> syn::Error {
+        syn::Error::new(span, format!("#[{}] {}", self.attr_name(), message))
+    }
+}
+
+pub(crate) struct ItemMetaInner {
+    pub item_ident: Ident,
+    pub meta_ident: Ident,
+    pub meta_map: HashMap<String, (usize, Meta)>,
+}
+
+impl ItemMetaInner {
+    pub(crate) fn from_nested<I>(
+        item_ident: Ident,
+        meta_ident: Ident,
+        nested: I,
+        allowed_names: &[&'static str],
+    ) -> Result<Self>
+    where
+        I: core::iter::Iterator<Item = NestedMeta>,
+    {
+        let mut meta_map = HashMap::new();
+        let mut has_literal = false;
+        for (index, nested) in nested.enumerate() {
+            let NestedMeta::Meta(meta) = nested else {
+                has_literal = true;
+                continue;
+            };
+            let Some(ident) = meta.path().get_ident() else {
+                continue;
+            };
+            let name = ident.to_string();
+            if !allowed_names.contains(&name.as_str()) {
+                bail_span!(
+                    ident,
+                    "#[{meta_ident}({name})] is not one of allowed attributes [{}]",
+                    allowed_names.iter().format(", ")
+                );
+            }
+            if let Some((_, previous)) = meta_map.insert(name, (index, meta)) {
+                return Err(syn::Error::new_spanned(
+                    previous,
+                    "this attribute path must be unique in the attribute",
+                ));
+            }
+        }
+        if has_literal {
+            bail_span!(meta_ident, "#[{meta_ident}(..)] cannot contain literal")
+        }
+
+        Ok(Self {
+            item_ident,
+            meta_ident,
+            meta_map,
+        })
+    }
+
+    pub(crate) fn contains_key(&self, key: &str) -> bool {
+        self.meta_map.contains_key(key)
+    }
+
+    pub(crate) fn item_name(&self) -> String {
+        self.item_ident.to_string()
+    }
+
+    pub(crate) fn meta_name(&self) -> String {
+        self.meta_ident.to_string()
+    }
+
+    pub(crate) fn _optional_str(&self, key: &str) -> Result<Option<String>> {
+        let value = if let Some((_, meta)) = self.meta_map.get(key) {
+            let Meta::NameValue(syn::MetaNameValue {
+                value:
+                    syn::Expr::Lit(syn::ExprLit {
+                        lit: syn::Lit::Str(lit),
+                        ..
+                    }),
+                ..
+            }) = meta
+            else {
+                bail_span!(
+                    meta,
+                    "#[{}({} = ...)] must exist as a string",
+                    self.meta_name(),
+                    key
+                )
+            };
+            Some(lit.value())
+        } else {
+            None
+        };
+        Ok(value)
+    }
+
+    pub(crate) fn _optional_path(&self, key: &str) -> Result<Option<syn::Path>> {
+        let value = if let Some((_, meta)) = self.meta_map.get(key) {
+            let Meta::NameValue(syn::MetaNameValue { value, .. }) = meta else {
+                bail_span!(
+                    meta,
+                    "#[{}({} = ...)] must be a name-value pair",
+                    self.meta_name(),
+                    key
+                )
+            };
+
+            // Try to parse as a Path (identifier or path like Foo or foo::Bar)
+            match syn::parse2::<syn::Path>(value.to_token_stream()) {
+                Ok(path) => Some(path),
+                Err(_) => {
+                    bail_span!(
+                        value,
+                        "#[{}({} = ...)] must be a valid type path (e.g., PyBaseException)",
+                        self.meta_name(),
+                        key
+                    )
+                }
+            }
+        } else {
+            None
+        };
+        Ok(value)
+    }
+
+    pub(crate) fn _bool(&self, key: &str) -> Result<bool> {
+        let value = if let Some((_, meta)) = self.meta_map.get(key) {
+            match meta {
+                Meta::NameValue(syn::MetaNameValue {
+                    value:
+                        syn::Expr::Lit(syn::ExprLit {
+                            lit: syn::Lit::Bool(lit),
+                            ..
+                        }),
+                    ..
+                }) => lit.value,
+                Meta::Path(_) => true,
+                _ => bail_span!(meta, "#[{}({})] is expected", self.meta_name(), key),
+            }
+        } else {
+            false
+        };
+        Ok(value)
+    }
+
+    pub(crate) fn _optional_list(&self, key: &str) -> Result<Option<PunctuatedNestedMeta>> {
+        self.meta_map
+            .get(key)
+            .map(|(_, meta)| {
+                let Meta::List(list) = meta else {
+                    bail_span!(meta, "#[{}({}(...))] must be a list", self.meta_name(), key)
+                };
+                nested_meta(list)
+            })
+            .transpose()
+    }
+}
+
+pub(crate) trait ItemMeta: Sized {
+    const ALLOWED_NAMES: &'static [&'static str];
+
+    fn from_attr(item_ident: Ident, attr: &Attribute) -> Result<Self> {
+        let (meta_ident, nested) = attr.ident_and_promoted_nested()?;
+        Self::from_nested(item_ident, meta_ident.clone(), nested.into_iter())
+    }
+
+    fn from_nested<I>(item_ident: Ident, meta_ident: Ident, nested: I) -> Result<Self>
+    where
+        I: core::iter::Iterator<Item = NestedMeta>,
+    {
+        Ok(Self::from_inner(ItemMetaInner::from_nested(
+            item_ident,
+            meta_ident,
+            nested,
+            Self::ALLOWED_NAMES,
+        )?))
+    }
+
+    fn from_inner(inner: ItemMetaInner) -> Self;
+    fn inner(&self) -> &ItemMetaInner;
+
+    fn text_signature(
+        &self,
+        receiver: Option<&str>,
+    ) -> Result<Option<crate::text_signature::TextSignature>> {
+        self.inner()
+            ._optional_str("text_signature")?
+            .map(|text| {
+                let span = self.inner().item_ident.span();
+                let signature = crate::text_signature::TextSignature::parse(text, span)?;
+                signature.validate_receiver(receiver, span)?;
+                Ok(signature)
+            })
+            .transpose()
+    }
+
+    fn simple_name(&self) -> Result<String> {
+        let inner = self.inner();
+        Ok(inner
+            ._optional_str("name")?
+            .unwrap_or_else(|| inner.item_name()))
+    }
+
+    fn optional_name(&self) -> Option<String> {
+        self.inner()._optional_str("name").ok().flatten()
+    }
+
+    fn new_meta_error(&self, msg: &str) -> syn::Error {
+        let inner = self.inner();
+        err_span!(inner.meta_ident, "#[{}] {}", inner.meta_name(), msg)
+    }
+}
+pub(crate) struct SimpleItemMeta(pub ItemMetaInner);
+
+impl ItemMeta for SimpleItemMeta {
+    const ALLOWED_NAMES: &'static [&'static str] = &["name"];
+
+    fn from_inner(inner: ItemMetaInner) -> Self {
+        Self(inner)
+    }
+
+    fn inner(&self) -> &ItemMetaInner {
+        &self.0
+    }
+}
+
+/// Module function metadata; flag-derived signatures deliberately opt out of Clinic text.
+pub(crate) struct FunctionItemMeta(pub ItemMetaInner);
+
+impl ItemMeta for FunctionItemMeta {
+    const ALLOWED_NAMES: &'static [&'static str] =
+        &["name", "signature_from_flags", "text_signature"];
+
+    fn from_inner(inner: ItemMetaInner) -> Self {
+        Self(inner)
+    }
+    fn inner(&self) -> &ItemMetaInner {
+        &self.0
+    }
+}
+
+impl FunctionItemMeta {
+    pub(crate) fn signature_from_flags(&self) -> Result<bool> {
+        self.inner()._bool("signature_from_flags")
+    }
+}
+
+pub(crate) struct ModuleItemMeta(pub ItemMetaInner);
+
+impl ItemMeta for ModuleItemMeta {
+    const ALLOWED_NAMES: &'static [&'static str] = &["name", "sub"];
+
+    fn from_inner(inner: ItemMetaInner) -> Self {
+        Self(inner)
+    }
+
+    fn inner(&self) -> &ItemMetaInner {
+        &self.0
+    }
+}
+
+impl ModuleItemMeta {
+    pub(crate) fn sub(&self) -> Result<bool> {
+        self.inner()._bool("sub")
+    }
+}
+
+pub(crate) struct AttrItemMeta(pub ItemMetaInner);
+
+impl ItemMeta for AttrItemMeta {
+    const ALLOWED_NAMES: &'static [&'static str] = &["name", "once"];
+
+    fn from_inner(inner: ItemMetaInner) -> Self {
+        Self(inner)
+    }
+
+    fn inner(&self) -> &ItemMetaInner {
+        &self.0
+    }
+}
+
+pub(crate) struct ClassItemMeta(ItemMetaInner);
+
+impl ItemMeta for ClassItemMeta {
+    const ALLOWED_NAMES: &'static [&'static str] = &[
+        "module",
+        "name",
+        "base",
+        "metaclass",
+        "unhashable",
+        "ctx",
+        "impl",
+        "traverse",
+        "clear", // tp_clear
+        "payload",
+    ];
+
+    fn from_inner(inner: ItemMetaInner) -> Self {
+        Self(inner)
+    }
+
+    fn inner(&self) -> &ItemMetaInner {
+        &self.0
+    }
+}
+
+impl ClassItemMeta {
+    pub(crate) fn class_name(&self) -> Result<String> {
+        const KEY: &str = "name";
+        let inner = self.inner();
+        if let Some((_, meta)) = inner.meta_map.get(KEY) {
+            match meta {
+                Meta::NameValue(syn::MetaNameValue {
+                    value:
+                        syn::Expr::Lit(syn::ExprLit {
+                            lit: syn::Lit::Str(lit),
+                            ..
+                        }),
+                    ..
+                }) => return Ok(lit.value()),
+                Meta::Path(_) => return Ok(inner.item_name()),
+                _ => {}
+            }
+        }
+        bail_span!(
+            inner.meta_ident,
+            "#[{attr_name}(name = ...)] must exist as a string. Try \
+             #[{attr_name}(name)] to use rust type name.",
+            attr_name = inner.meta_name()
+        )
+    }
+
+    pub(crate) fn ctx_name(&self) -> Result<Option<String>> {
+        self.inner()._optional_str("ctx")
+    }
+
+    pub(crate) fn manual_payload(&self) -> Result<bool> {
+        Ok(self.inner()._optional_str("payload")?.as_deref() == Some("manual"))
+    }
+
+    pub(crate) fn base(&self) -> Result<Option<syn::Path>> {
+        self.inner()._optional_path("base")
+    }
+
+    pub(crate) fn unhashable(&self) -> Result<bool> {
+        self.inner()._bool("unhashable")
+    }
+
+    pub(crate) fn metaclass(&self) -> Result<Option<String>> {
+        self.inner()._optional_str("metaclass")
+    }
+
+    pub(crate) fn module(&self) -> Result<Option<String>> {
+        const KEY: &str = "module";
+        let inner = self.inner();
+        let value = if let Some((_, meta)) = inner.meta_map.get(KEY) {
+            match meta {
+                Meta::NameValue(syn::MetaNameValue {
+                    value: syn::Expr::Lit(syn::ExprLit{lit:syn::Lit::Str(lit),..}),
+                    ..
+                }) => Ok(Some(lit.value())),
+                Meta::NameValue(syn::MetaNameValue {
+                    value: syn::Expr::Lit(syn::ExprLit{lit:syn::Lit::Bool(lit),..}),
+                    ..
+                }) => if lit.value {
+                    Err(lit.span())
+                } else {
+                    Ok(None)
+                }
+                other => Err(other.span()),
+            }
+        } else {
+            Err(inner.item_ident.span())
+        }.map_err(|span| syn::Error::new(
+            span,
+            format!(
+                "#[{attr_name}(module = ...)] must exist as a string or false. Try #[{attr_name}(module = false)] for built-in types.",
+                attr_name=inner.meta_name()
+            ),
+        ))?;
+        Ok(value)
+    }
+
+    pub(crate) fn impl_attrs(&self) -> Result<Option<String>> {
+        self.inner()._optional_str("impl")
+    }
+
+    // pub fn mandatory_module(&self) -> Result<String> {
+    //     let inner = self.inner();
+    //     let value = self.module().ok().flatten().
+    //     ok_or_else(|| err_span!(
+    //         inner.meta_ident,
+    //         "#[{attr_name}(module = ...)] must exist as a string. Built-in module is not allowed here.",
+    //         attr_name = inner.meta_name()
+    //     ))?;
+    //     Ok(value)
+    // }
+}
+
+pub(crate) struct ExceptionItemMeta(ClassItemMeta);
+
+impl ItemMeta for ExceptionItemMeta {
+    const ALLOWED_NAMES: &'static [&'static str] = &[
+        "module",
+        "name",
+        "base",
+        "unhashable",
+        "ctx",
+        "impl",
+        "traverse",
+        "payload",
+    ];
+
+    fn from_inner(inner: ItemMetaInner) -> Self {
+        Self(ClassItemMeta(inner))
+    }
+
+    fn inner(&self) -> &ItemMetaInner {
+        &self.0.0
+    }
+}
+
+impl ExceptionItemMeta {
+    pub(crate) fn class_name(&self) -> Result<String> {
+        const KEY: &str = "name";
+        let inner = self.inner();
+        if let Some((_, meta)) = inner.meta_map.get(KEY) {
+            match meta {
+                Meta::NameValue(syn::MetaNameValue {
+                    value:
+                        syn::Expr::Lit(syn::ExprLit {
+                            lit: syn::Lit::Str(lit),
+                            ..
+                        }),
+                    ..
+                }) => return Ok(lit.value()),
+                Meta::Path(_) => {
+                    return Ok({
+                        let type_name = inner.item_name();
+                        let Some(py_name) = type_name.as_str().strip_prefix("Py") else {
+                            bail_span!(
+                                inner.item_ident,
+                                "#[pyexception] expects its underlying type to be named `Py` prefixed"
+                            )
+                        };
+                        py_name.to_string()
+                    });
+                }
+                _ => {}
+            }
+        }
+        bail_span!(
+            inner.meta_ident,
+            "#[{attr_name}(name = ...)] must exist as a string. Try \
+             #[{attr_name}(name)] to use rust type name.",
+            attr_name = inner.meta_name()
+        )
+    }
+
+    pub(crate) fn has_impl(&self) -> Result<bool> {
+        self.inner()._bool("impl")
+    }
+
+    /// `module = "..."` when present. Omitted means a builtin exception.
+    pub(crate) fn optional_module(&self) -> Result<Option<String>> {
+        if self.inner().meta_map.contains_key("module") {
+            self.module()
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl core::ops::Deref for ExceptionItemMeta {
+    type Target = ClassItemMeta;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+pub(crate) trait AttributeExt {
+    fn promoted_nested(&self) -> Result<PunctuatedNestedMeta>;
+
+    fn ident_and_promoted_nested(&self) -> Result<(&Ident, PunctuatedNestedMeta)>;
+
+    fn try_remove_name(&mut self, name: &str) -> Result<Option<NestedMeta>>;
+
+    fn fill_nested_meta<F>(&mut self, name: &str, new_item: F) -> Result<()>
+    where
+        F: Fn() -> NestedMeta;
+}
+
+impl AttributeExt for Attribute {
+    fn promoted_nested(&self) -> Result<PunctuatedNestedMeta> {
+        match &self.meta {
+            Meta::Path(_) => Ok(PunctuatedNestedMeta::new()),
+            Meta::List(list) => nested_meta(list),
+            meta => {
+                let mut error = syn::Error::new_spanned(
+                    meta,
+                    "Only Path can be promoted and List is accepted as non-promoted",
+                );
+                let name = self.path().get_ident().unwrap();
+                error.combine(err_span!(
+                    self,
+                    r##"#[{name} = "..."] cannot be a name/value, you probably meant \
+                     #[{name}(name = "...")]"##
+                ));
+                Err(error)
+            }
+        }
+    }
+
+    fn ident_and_promoted_nested(&self) -> Result<(&Ident, PunctuatedNestedMeta)> {
+        Ok((self.path().get_ident().unwrap(), self.promoted_nested()?))
+    }
+
+    fn try_remove_name(&mut self, item_name: &str) -> Result<Option<NestedMeta>> {
+        let Meta::List(list) = &mut self.meta else {
+            bail_span!(
+                self.meta,
+                "#[{name}(...)] doesn't contain '{item}' to remove",
+                name = self.path().get_ident().unwrap(),
+                item = item_name
+            );
+        };
+        let nested = nested_meta(list)?;
+        let mut retained = PunctuatedNestedMeta::new();
+        let mut removed = None;
+        for pair in nested.into_pairs() {
+            if pair
+                .value()
+                .get_ident()
+                .is_some_and(|ident| ident == item_name)
+            {
+                if removed.is_some() {
+                    bail_span!(
+                        pair.value(),
+                        "#[py..({item_name}...)] must be unique but found multiple times"
+                    );
+                }
+                removed = Some(pair.into_value());
+            } else {
+                retained.extend([pair]);
+            }
+        }
+        list.tokens = retained.into_token_stream();
+        Ok(removed)
+    }
+
+    fn fill_nested_meta<F>(&mut self, name: &str, new_item: F) -> Result<()>
+    where
+        F: Fn() -> NestedMeta,
+    {
+        let mut nested = self.promoted_nested()?;
+        if !nested.iter().any(|item| {
+            matches!(item,
+            NestedMeta::Meta(meta) if meta.path().is_ident(name))
+        }) {
+            nested.push(new_item());
+        }
+        match &mut self.meta {
+            Meta::List(list) => list.tokens = nested.into_token_stream(),
+            Meta::Path(path) => {
+                self.meta = Meta::List(syn::MetaList {
+                    path: path.clone(),
+                    delimiter: syn::MacroDelimiter::Paren(Default::default()),
+                    tokens: nested.into_token_stream(),
+                })
+            }
+            Meta::NameValue(_) => unreachable!("promoted_nested rejects name-value attributes"),
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn pyclass_ident_and_attrs(item: &syn::Item) -> Result<(&Ident, &[Attribute])> {
+    Ok(match item {
+        syn::Item::Struct(syn::ItemStruct { ident, attrs, .. }) => (ident, attrs),
+        syn::Item::Enum(syn::ItemEnum { ident, attrs, .. }) => (ident, attrs),
+        syn::Item::Use(item_use) => (
+            iter_use_idents(item_use, |ident, _is_unique| Ok(ident))?
+                .into_iter()
+                .exactly_one()
+                .map_err(|_| {
+                    err_span!(
+                        item_use,
+                        "#[pyclass] can only be on single name use statement",
+                    )
+                })?,
+            &item_use.attrs,
+        ),
+        other => {
+            bail_span!(
+                other,
+                "#[pyclass] can only be on a struct, enum or use declaration",
+            )
+        }
+    })
+}
+
+pub(crate) fn pyexception_ident_and_attrs(item: &syn::Item) -> Result<(&Ident, &[Attribute])> {
+    Ok(match item {
+        syn::Item::Struct(syn::ItemStruct { ident, attrs, .. }) => (ident, attrs),
+        syn::Item::Enum(syn::ItemEnum { ident, attrs, .. }) => (ident, attrs),
+        other => {
+            bail_span!(other, "#[pyexception] can only be on a struct or enum",)
+        }
+    })
+}
+
+pub(crate) trait ErrorVec: Sized {
+    fn into_error(self) -> Option<syn::Error>;
+
+    fn into_result(self) -> Result<()> {
+        if let Some(error) = self.into_error() {
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn ok_or_push<T>(&mut self, r: Result<T>) -> Option<T>;
+}
+
+impl ErrorVec for Vec<syn::Error> {
+    fn into_error(self) -> Option<syn::Error> {
+        let mut iter = self.into_iter();
+        if let Some(mut first) = iter.next() {
+            for err in iter {
+                first.combine(err);
+            }
+            Some(first)
+        } else {
+            None
+        }
+    }
+
+    fn ok_or_push<T>(&mut self, r: Result<T>) -> Option<T> {
+        match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                self.push(e);
+                None
+            }
+        }
+    }
+}
+
+pub(crate) fn iter_use_idents<'a, F, R: 'a>(item_use: &'a syn::ItemUse, mut f: F) -> Result<Vec<R>>
+where
+    F: FnMut(&'a syn::Ident, bool) -> Result<R>,
+{
+    let mut result = Vec::new();
+    match &item_use.tree {
+        UseTree::Name(name) => result.push(f(&name.ident, true)?),
+        UseTree::Rename(rename) => result.push(f(&rename.rename, true)?),
+        UseTree::Path(path) => match &*path.tree {
+            UseTree::Name(name) => result.push(f(&name.ident, true)?),
+            UseTree::Rename(rename) => result.push(f(&rename.rename, true)?),
+            other => iter_use_tree_idents(other, &mut result, &mut f)?,
+        },
+        other => iter_use_tree_idents(other, &mut result, &mut f)?,
+    }
+    Ok(result)
+}
+
+fn iter_use_tree_idents<'a, F, R: 'a>(
+    tree: &'a syn::UseTree,
+    result: &mut Vec<R>,
+    f: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&'a syn::Ident, bool) -> Result<R>,
+{
+    match tree {
+        UseTree::Name(name) => result.push(f(&name.ident, false)?),
+        UseTree::Rename(rename) => result.push(f(&rename.rename, false)?),
+        UseTree::Path(path) => iter_use_tree_idents(&path.tree, result, f)?,
+        UseTree::Group(syn::UseGroup { items, .. }) => {
+            for subtree in items {
+                iter_use_tree_idents(subtree, result, f)?;
+            }
+        }
+        UseTree::Glob(glob) => {
+            bail_span!(glob, "#[py*] doesn't allow '*'")
+        }
+    }
+    Ok(())
+}
+
+enum SigPiece {
+    Marker(String),
+    Arg {
+        name: String,
+        ty: Type,
+    },
+    /// Parameters of the argument a method binds as its receiver.
+    Implicit(Type),
+}
+
+/// A leading `&Py<PyModule>` is injected by the module function adapter.
+/// A leading `PyRef<PyModule>` is rejected; later positions remain ordinary
+/// Python arguments. This is syntax-based: Rust aliases cannot be resolved by
+/// a procedural macro.
+pub(crate) fn has_module_receiver(sig: &Signature) -> Result<bool> {
+    let Some(FnArg::Typed(arg)) = sig.inputs.first() else {
+        return Ok(false);
+    };
+    let (ty, wrapper, mutable) = match &*arg.ty {
+        Type::Reference(reference) => (&*reference.elem, "Py", reference.mutability.is_some()),
+        ty => (ty, "PyRef", false),
+    };
+    let Type::Path(path) = ty else {
+        return Ok(false);
+    };
+    let Some(segment) = path.path.segments.last() else {
+        return Ok(false);
+    };
+    if segment.ident != wrapper {
+        return Ok(false);
+    }
+    let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+        return Ok(false);
+    };
+    let Some(syn::GenericArgument::Type(Type::Path(payload))) = arguments.args.first() else {
+        return Ok(false);
+    };
+    let is_module = arguments.args.len() == 1
+        && payload
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "PyModule");
+    if is_module && (mutable || wrapper == "PyRef") {
+        return Err(syn::Error::new_spanned(
+            &arg.ty,
+            "the module receiver must be &Py<PyModule>",
+        ));
+    }
+    Ok(is_module)
+}
+
+fn is_vm_or_callee(ty: &Type) -> bool {
+    if let Type::Path(path) = ty
+        && path
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "Callee")
+    {
+        return true;
+    }
+    let ty = quote!(#ty).to_string().replace(' ', "");
+    ty.starts_with('&') && ty.ends_with("VirtualMachine")
+}
+
+fn arg_name(pat: &syn::Pat) -> String {
+    match pat {
+        syn::Pat::Ident(pat) => {
+            let ident = pat.ident.unraw().to_string();
+            ident.strip_prefix('_').unwrap_or(&ident).to_owned()
+        }
+        // `Fildes(fd): Fildes` contributes `fd`. One binding only: a wider
+        // pattern has no single parameter name. The name is unused when the
+        // type supplies parameters.
+        syn::Pat::TupleStruct(pat) if pat.elems.len() == 1 => arg_name(&pat.elems[0]),
+        syn::Pat::Reference(pat) => arg_name(&pat.pat),
+        syn::Pat::Paren(pat) => arg_name(&pat.pat),
+        _ => String::new(),
+    }
+}
+
+fn mentions_self(ty: &Type) -> bool {
+    struct Finder(bool);
+    impl Visit<'_> for Finder {
+        fn visit_ident(&mut self, ident: &Ident) {
+            if ident == "Self" {
+                self.0 = true;
+            }
+        }
+    }
+    let mut finder = Finder(false);
+    finder.visit_type(ty);
+    finder.0
+}
+
+fn subst_self(ty: &Type, self_ty: Option<&Type>) -> Type {
+    struct Subst<'a>(&'a Type);
+    impl VisitMut for Subst<'_> {
+        fn visit_type_mut(&mut self, ty: &mut Type) {
+            if let Type::Path(path) = ty
+                && path.qself.is_none()
+                && path.path.is_ident("Self")
+            {
+                *ty = self.0.clone();
+                return;
+            }
+            syn::visit_mut::visit_type_mut(self, ty);
+        }
+    }
+    let Some(self_ty) = self_ty else {
+        return ty.clone();
+    };
+    let mut ty = ty.clone();
+    Subst(self_ty).visit_type_mut(&mut ty);
+    ty
+}
+
+fn sig_pieces(
+    sig: &Signature,
+    implicit_self: Option<&str>,
+    self_ty: Option<&Type>,
+    leading_marker: Option<&str>,
+) -> Vec<SigPiece> {
+    let mut pieces = Vec::new();
+    if let Some(marker) = leading_marker {
+        pieces.push(SigPiece::Marker(marker.to_owned()));
+    }
+    let mut implicit_self = implicit_self.map(str::to_owned);
+    for arg in &sig.inputs {
+        match arg {
+            FnArg::Receiver(_) => pieces.push(SigPiece::Marker("$self".to_owned())),
+            FnArg::Typed(typed) => {
+                if is_vm_or_callee(&typed.ty) {
+                    continue;
+                }
+                let name = arg_name(&typed.pat);
+                let ty = subst_self(&typed.ty, self_ty);
+                // References carry a lifetime, so `FromArgs` cannot be named
+                // from a const item. They are leaf positional parameters.
+                let leaf = mentions_self(&ty) || matches!(ty, Type::Reference(_));
+                if let Some(marker) = implicit_self.take() {
+                    // A nested const cannot name `Self`. The receiver is the
+                    // marker; only a type that supplies parameters is kept.
+                    pieces.push(SigPiece::Marker(marker));
+                    if !leaf {
+                        pieces.push(SigPiece::Implicit(ty));
+                    }
+                } else if leaf {
+                    pieces.push(SigPiece::Marker(name));
+                } else {
+                    pieces.push(SigPiece::Arg { name, ty });
+                }
+            }
+        }
+    }
+    pieces
+}
+
+fn sig_arg_tokens(piece: &SigPiece) -> TokenStream {
+    match piece {
+        SigPiece::Marker(name) => quote!(::rustpython_vm::function::SigArg::marker(#name)),
+        SigPiece::Arg { name, ty } => {
+            quote!(::rustpython_vm::function::SigArg::from_arg::<#ty>(#name))
+        }
+        SigPiece::Implicit(ty) => quote!(::rustpython_vm::function::SigArg::implicit::<#ty>()),
+    }
+}
+
+fn args_const(pieces: &[SigPiece]) -> TokenStream {
+    let args = pieces.iter().map(sig_arg_tokens);
+    quote! {
+        const ARGS: &[::rustpython_vm::function::SigArg] = &[#(#args),*];
+    }
+}
+
+/// Expression of type `ItemDoc`.
+/// `doc` is a const `ItemDoc` already chosen by the caller (a Rust doc comment
+/// wins over the stored docstring). A database id keeps only the signature
+/// prefix as static text. A Rust docstring is composed into one literal.
+pub(crate) fn internal_doc_tokens(
+    sig: &Signature,
+    py_name: &str,
+    implicit_self: Option<&str>,
+    doc: TokenStream,
+    self_ty: Option<&Type>,
+    leading_marker: Option<&str>,
+    text_signature: Option<&crate::text_signature::TextSignature>,
+) -> TokenStream {
+    let pieces = sig_pieces(sig, implicit_self, self_ty, leading_marker);
+    let args = args_const(&pieces);
+    let user_pieces = pieces
+        .iter()
+        .filter(|piece| match piece {
+            SigPiece::Implicit(_) => false,
+            SigPiece::Marker(name) => !name.starts_with('$'),
+            _ => true,
+        })
+        .collect::<Vec<_>>();
+    let binding = user_pieces.iter().map(|piece| sig_arg_tokens(piece));
+    let shared = user_pieces.iter().map(|piece| match piece {
+        SigPiece::Arg { ty, .. } => {
+            quote!(<#ty as ::rustpython_vm::function::ArgsMetadata>::TEXT_SIGNATURE)
+        }
+        _ => quote!(None),
+    });
+    let receiver = leading_marker.or(implicit_self).or_else(|| {
+        sig.inputs
+            .iter()
+            .any(|arg| matches!(arg, FnArg::Receiver(_)))
+            .then_some("$self")
+    });
+    let receiver = match receiver {
+        Some(marker) => quote!(Some(#marker)),
+        None => quote!(None),
+    };
+    let selection = if let Some(signature) = text_signature {
+        let text = &signature.text;
+        let params = signature.params_tokens();
+        let validator = signature.validator();
+        quote! {
+            const BINDING_ARGS: &[::rustpython_vm::function::SigArg] = &[#(#binding),*];
+            const _: () = {
+                assert!(SHARED.is_none(), "text_signature is already declared on the argument spec");
+                #validator(BINDING_ARGS, &[#(#params),*]);
+            };
+            const OVERRIDE: Option<(&str, Option<&str>)> = Some((#text, None));
+        }
+    } else {
+        quote! { const OVERRIDE: Option<(&str, Option<&str>)> = match SHARED {
+            Some(text) => Some((text, #receiver)), None => None,
+        }; }
+    };
+    let args = quote! {
+        #args
+        const SHARED: Option<&str> = ::rustpython_vm::function::argument_text_signature(&[#(#shared),*]);
+        #selection
+    };
+    doc_from_signature_args(py_name, doc, args)
+}
+
+/// CPython's flags-based fallback, evaluated entirely during compilation.
+pub(crate) fn flags_signature_doc_tokens(
+    sig: &Signature,
+    py_name: &str,
+    doc: TokenStream,
+) -> TokenStream {
+    let pieces = sig_pieces(sig, None, None, None);
+    let original = args_const(&pieces);
+    let shared = pieces.iter().map(|piece| match piece {
+        SigPiece::Arg { ty, .. } => {
+            quote!(<#ty as ::rustpython_vm::function::ArgsMetadata>::TEXT_SIGNATURE)
+        }
+        _ => quote!(None),
+    });
+    let args = quote! {
+        const ARGS: &[::rustpython_vm::function::SigArg] = {
+            #original
+            assert!(::rustpython_vm::function::argument_text_signature(&[#(#shared),*]).is_none(),
+                "text_signature and signature_from_flags are mutually exclusive");
+            ::rustpython_vm::function::signature_from_flags(ARGS)
+        };
+    };
+    doc_from_signature_args(
+        py_name,
+        doc,
+        quote!(#args const OVERRIDE: Option<(&str, Option<&str>)> = None;),
+    )
+}
+
+pub(crate) fn doc_from_signature_args(
+    py_name: &(impl ToTokens + ?Sized),
+    doc: TokenStream,
+    args_const: TokenStream,
+) -> TokenStream {
+    let prefix_len = quote! { match OVERRIDE {
+        Some((text, receiver)) => #py_name.len() + ::rustpython_vm::function::text_signature_len(text, receiver) + 5,
+        None => ::rustpython_vm::function::signature_prefix_len(#py_name, ARGS),
+    } };
+    let prefix_bytes = quote! { match OVERRIDE {
+        Some((text, receiver)) => ::rustpython_vm::function::text_signature_doc_bytes::<N>(#py_name, text, receiver, ""),
+        None => ::rustpython_vm::function::signature_prefix_bytes::<N>(#py_name, ARGS),
+    } };
+    let full_len = quote! { match OVERRIDE {
+        Some((text, receiver)) => #py_name.len() + ::rustpython_vm::function::text_signature_len(text, receiver) + 5 + BODY.len(),
+        None => ::rustpython_vm::function::internal_doc_len(#py_name, ARGS, BODY),
+    } };
+    let full_bytes = quote! { match OVERRIDE {
+        Some((text, receiver)) => ::rustpython_vm::function::text_signature_doc_bytes::<N>(#py_name, text, receiver, BODY),
+        None => ::rustpython_vm::function::internal_doc_bytes::<N>(#py_name, ARGS, BODY),
+    } };
+    quote! {
+        {
+            #args_const
+            const BASE: ::rustpython_vm::function::ItemDoc = #doc;
+            if OVERRIDE.is_none() && !::rustpython_vm::function::has_signature(ARGS) {
+                if BASE.len == 0 {
+                    match BASE.text {
+                        Some(text) if !text.is_empty() => {
+                            ::rustpython_vm::function::ItemDoc::static_text(text)
+                        }
+                        _ => ::rustpython_vm::function::ItemDoc::NONE,
+                    }
+                } else {
+                    BASE
+                }
+            } else if BASE.len != 0 {
+                const N: usize = #prefix_len;
+                const B: [u8; N] =
+                    #prefix_bytes;
+                const PREFIX: &str = match ::core::str::from_utf8(&B) {
+                    Ok(s) => s,
+                    Err(_) => panic!(),
+                };
+                ::rustpython_vm::__cfg_doc!({
+                    ::rustpython_vm::function::ItemDoc {
+                        text: Some(PREFIX),
+                        offset: BASE.offset,
+                        len: BASE.len,
+                    }
+                } else {
+                    ::rustpython_vm::function::ItemDoc::static_text(PREFIX)
+                })
+            } else {
+                const BODY: &str = match BASE.text {
+                    Some(text) => text,
+                    None => "",
+                };
+                const N: usize = #full_len;
+                const B: [u8; N] =
+                    #full_bytes;
+                const FULL: &str = match ::core::str::from_utf8(&B) {
+                    Ok(s) => s,
+                    Err(_) => panic!(),
+                };
+                ::rustpython_vm::function::ItemDoc::static_text(FULL)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    use syn::{parse::Parser, parse_quote};
+
+    #[test]
+    fn module_receiver_has_no_opt_in() {
+        let attr = parse_quote!(#[pyfunction(with_module)]);
+        assert!(FunctionItemMeta::from_attr(parse_quote!(f), &attr).is_err());
+    }
+
+    #[test]
+    fn module_receiver_rejects_owned_ref_and_mutable_borrow() {
+        for signature in [
+            parse_quote!(fn f(module: &mut Py<PyModule>)),
+            parse_quote!(fn f(module: PyRef<PyModule>, value: u8)),
+            parse_quote!(fn f(module: crate::PyRef<crate::builtins::PyModule>)),
+        ] {
+            assert!(has_module_receiver(&signature).is_err());
+        }
+    }
+
+    #[test]
+    fn module_receiver_is_a_leading_module_payload() {
+        for signature in [
+            parse_quote!(fn f(module: &Py<PyModule>, value: u8)),
+            parse_quote!(fn f(module: &crate::Py<crate::builtins::PyModule>)),
+        ] {
+            assert!(has_module_receiver(&signature).unwrap());
+        }
+        for signature in [
+            parse_quote!(fn f(value: PyRef<PyType>)),
+            parse_quote!(fn f(value: PyObjectRef)),
+            parse_quote!(fn f(value: u8, module: PyRef<PyModule>)),
+            parse_quote!(fn f()),
+        ] {
+            assert!(!has_module_receiver(&signature).unwrap());
+        }
+    }
+
+    fn parse_options(source: &str) -> Result<ItemMetaInner> {
+        let args = PunctuatedNestedMeta::parse_terminated.parse_str(source)?;
+        ItemMetaInner::from_nested(
+            parse_quote!(Example),
+            parse_quote!(pyclass),
+            args.into_iter(),
+            &["name", "impl"],
+        )
+    }
+
+    #[test]
+    fn signature_from_flags_is_a_module_function_only_opt_in() {
+        let attr = parse_quote!(#[pyfunction(name = "alias", signature_from_flags)]);
+        let meta = FunctionItemMeta::from_attr(parse_quote!(function), &attr).unwrap();
+        assert_eq!(meta.simple_name().unwrap(), "alias");
+        assert!(meta.signature_from_flags().unwrap());
+        let ordinary = parse_quote!(#[pyfunction]);
+        assert!(
+            !FunctionItemMeta::from_attr(parse_quote!(function), &ordinary)
+                .unwrap()
+                .signature_from_flags()
+                .unwrap()
+        );
+        assert!(SimpleItemMeta::from_attr(parse_quote!(function), &attr).is_err());
+        let invalid = parse_quote!(#[pyfunction(signature_from_flags = "arbitrary text")]);
+        let result = FunctionItemMeta::from_attr(parse_quote!(function), &invalid);
+        assert!(result.and_then(|meta| meta.signature_from_flags()).is_err());
+    }
+
+    #[test]
+    fn signature_receiver_validation_precedes_codegen() {
+        let module: Attribute = parse_quote!(#[pyfunction(text_signature = "($self, value, /)")]);
+        let meta = FunctionItemMeta::from_attr(parse_quote!(sample), &module).unwrap();
+        assert!(meta.text_signature(Some("$module")).is_err());
+        assert!(meta.text_signature(None).is_err());
+        assert!(meta.text_signature(Some("$self")).is_ok());
+    }
+
+    #[test]
+    fn shared_signature_uses_only_python_argument_specs() {
+        let signature: Signature =
+            parse_quote!(fn method(zelf: PyRef<Example>, args: SearchArgs, vm: &VirtualMachine));
+        let tokens = internal_doc_tokens(
+            &signature,
+            "method",
+            Some("$self"),
+            quote!(Doc),
+            None,
+            None,
+            None,
+        )
+        .to_string();
+        let binding = tokens
+            .split("const SHARED")
+            .nth(1)
+            .unwrap()
+            .split("const OVERRIDE")
+            .next()
+            .unwrap();
+        assert!(binding.contains("SearchArgs"));
+        assert!(!binding.contains("PyRef"));
+        assert!(!binding.contains("$self"));
+        assert!(tokens.contains("ArgsMetadata > :: TEXT_SIGNATURE"));
+        let signature: Signature = parse_quote!(fn ordinary(value: PyRef<Example>));
+        let tokens =
+            internal_doc_tokens(&signature, "ordinary", None, quote!(Doc), None, None, None)
+                .to_string();
+        let binding = tokens
+            .split("const SHARED")
+            .nth(1)
+            .unwrap()
+            .split("const OVERRIDE")
+            .next()
+            .unwrap();
+        assert!(binding.contains("PyRef"));
+    }
+
+    #[test]
+    fn explicit_signature_is_checked_even_without_generated_display_or_docs() {
+        let sig: Signature = parse_quote!(fn sample((a, b): ValueArgs));
+        let signature = crate::text_signature::TextSignature::parse(
+            "($module, value, /)".into(),
+            Span::call_site(),
+        )
+        .unwrap();
+        for doc in [
+            quote!(::rustpython_vm::function::ItemDoc::NONE),
+            quote!(::rustpython_vm::function::ItemDoc::static_text("Body")),
+            quote!(::rustpython_vm::function::ItemDoc {
+                text: None,
+                offset: 1,
+                len: 4
+            }),
+        ] {
+            let tokens = internal_doc_tokens(
+                &sig,
+                "sample",
+                None,
+                doc,
+                None,
+                Some("$module"),
+                Some(&signature),
+            )
+            .to_string();
+            assert!(tokens.contains("validate_text_signature (BINDING_ARGS"));
+            assert!(tokens.contains("if OVERRIDE . is_none () && !"));
+            assert!(tokens.contains("text_signature_doc_bytes"));
+            assert!(tokens.contains("ValueArgs"));
+            assert!(tokens.contains("offset : BASE . offset"));
+            assert!(tokens.contains("len : BASE . len"));
+        }
+    }
+
+    #[test]
+    fn signature_from_flags_codegen_preserves_original_argument_metadata() {
+        let sig: Signature = parse_quote!(fn sample(value: ValueArgs, vm: &VirtualMachine));
+        let doc = quote!(::rustpython_vm::function::ItemDoc::NONE);
+        let from_flags = flags_signature_doc_tokens(&sig, "sample", doc.clone()).to_string();
+        assert!(from_flags.contains("signature_from_flags"));
+        assert!(from_flags.contains("ValueArgs"));
+        assert!(from_flags.contains("TEXT_SIGNATURE"));
+        assert!(from_flags.contains("mutually exclusive"));
+        let ordinary =
+            internal_doc_tokens(&sig, "sample", None, doc, None, Some("$module"), None).to_string();
+        assert!(!ordinary.contains("signature_from_flags"));
+        assert!(ordinary.contains("$module"));
+    }
+
+    #[test]
+    fn option_validation_keeps_contextual_diagnostics() {
+        assert_eq!(
+            parse_options("name, name").err().unwrap().to_string(),
+            "this attribute path must be unique in the attribute"
+        );
+        assert_eq!(
+            parse_options("7").err().unwrap().to_string(),
+            "#[pyclass(..)] cannot contain literal"
+        );
+        assert_eq!(
+            parse_options("unknown").err().unwrap().to_string(),
+            "#[pyclass(unknown)] is not one of allowed attributes [name, impl]"
+        );
+        let options = parse_options("impl, name = \"Example\"").unwrap();
+        assert!(options._bool("impl").unwrap());
+        assert_eq!(
+            options._optional_str("name").unwrap().as_deref(),
+            Some("Example")
+        );
+    }
+
+    #[test]
+    fn attribute_edits_preserve_other_options_and_delimiters() {
+        let mut attr: Attribute = parse_quote!(#[pyclass(name, no_attr, module = false,)]);
+        assert!(attr.try_remove_name("no_attr").unwrap().is_some());
+        attr.fill_nested_meta("module", || parse_quote!(module = "replacement"))
+            .unwrap();
+        assert_eq!(
+            quote!(#attr).to_string(),
+            quote!(#[pyclass(name, module = false,)]).to_string()
+        );
+        assert!(attr.try_remove_name("missing").unwrap().is_none());
+        let mut bare: Attribute = parse_quote!(#[pyclass]);
+        bare.fill_nested_meta("name", || parse_quote!(name = "Example"))
+            .unwrap();
+        assert_eq!(
+            quote!(#bare).to_string(),
+            quote!(#[pyclass(name = "Example")]).to_string()
+        );
+    }
+
+    #[test]
+    fn failed_duplicate_removal_does_not_mutate_attribute() {
+        let mut attr: Attribute = parse_quote!(#[pyclass(no_attr, no_attr)]);
+        let original = quote!(#attr).to_string();
+        assert_eq!(
+            attr.try_remove_name("no_attr").err().unwrap().to_string(),
+            "#[py..(no_attr...)] must be unique but found multiple times"
+        );
+        assert_eq!(quote!(#attr).to_string(), original);
+    }
+}

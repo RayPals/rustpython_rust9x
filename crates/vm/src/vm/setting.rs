@@ -1,0 +1,262 @@
+use core::num::NonZeroI32;
+use std::ffi::OsString;
+
+/// Path configuration computed at runtime (like PyConfig path outputs)
+#[derive(Debug, Clone, Default)]
+pub struct Paths {
+    /// program_name: the name the interpreter was invoked as
+    pub program_name: OsString,
+    /// sys.executable
+    pub executable: String,
+    /// sys._base_executable (original interpreter in venv)
+    pub base_executable: String,
+    /// sys.prefix
+    pub prefix: String,
+    /// sys.base_prefix
+    pub base_prefix: String,
+    /// sys.exec_prefix
+    pub exec_prefix: String,
+    /// sys.base_exec_prefix
+    pub base_exec_prefix: String,
+    /// sys._stdlib_dir
+    pub stdlib_dir: Option<String>,
+    /// Computed native search paths, decoded with the filesystem codec into sys.path.
+    pub module_search_paths: Vec<OsString>,
+}
+
+/// Combined configuration: user settings + computed paths
+/// CPython directly exposes every fields under both of them.
+/// We separate them to maintain better ownership discipline.
+#[derive(Clone)]
+pub struct PyConfig {
+    pub settings: Settings,
+    pub paths: Paths,
+    pub(super) filesystem: alloc::sync::Arc<super::filesystem::FilesystemCodec>,
+}
+
+impl PyConfig {
+    #[must_use]
+    pub fn new(mut settings: Settings, paths: Paths) -> Self {
+        if cfg!(windows) && settings.legacy_windows_fs_encoding {
+            settings.utf8_mode = 0;
+        }
+        if settings.utf8_mode < 0 {
+            settings.utf8_mode = 1;
+        }
+        let filesystem = alloc::sync::Arc::new(super::filesystem::FilesystemCodec::new(&settings));
+        Self {
+            settings,
+            paths,
+            filesystem,
+        }
+    }
+}
+
+/// User-configurable settings for the python vm.
+#[non_exhaustive]
+#[derive(Clone)]
+pub struct Settings {
+    /// -I
+    pub isolated: bool,
+
+    // int use_environment
+    /// -Xdev
+    pub dev_mode: bool,
+
+    /// Not set SIGINT handler(i.e. for embedded mode)
+    pub install_signal_handlers: bool,
+
+    /// PYTHONHASHSEED=x
+    /// None means use_hash_seed = 0 in CPython
+    pub hash_seed: Option<u32>,
+
+    /// -X faulthandler, PYTHONFAULTHANDLER
+    pub faulthandler: bool,
+
+    // int tracemalloc;
+    // int perf_profiling;
+    /// -X importtime, PYTHONPROFILEIMPORTTIME: 2 also reports cached imports.
+    pub import_time: u8,
+    /// -X no_debug_ranges: disable column info in bytecode
+    pub code_debug_ranges: bool,
+    // int show_ref_count;
+    // int dump_refs;
+    // wchar_t *dump_refs_file;
+    // int malloc_stats;
+    /// -X pycache_prefix, PYTHONPYCACHEPREFIX
+    pub pycache_prefix: Option<OsString>,
+    // int parse_argv;
+    // PyWideStringList orig_argv;
+    /// sys.argv, decoded with the filesystem encoding during sys initialization.
+    pub argv: Vec<OsString>,
+
+    // spell-checker:ignore Xfoo
+    /// -Xfoo[=bar]
+    pub xoptions: Vec<(String, Option<String>)>,
+
+    // spell-checker:ignore Wfoo
+    /// -Wfoo
+    pub warnoptions: Vec<String>,
+
+    /// -S
+    pub import_site: bool,
+
+    /// -b
+    pub bytes_warning: u64,
+
+    /// -X warn_default_encoding, PYTHONWARNDEFAULTENCODING
+    pub warn_default_encoding: bool,
+
+    /// -X thread_inherit_context, whether new threads inherit context from parent
+    pub thread_inherit_context: bool,
+
+    /// -X context_aware_warnings, whether warnings are context aware
+    pub context_aware_warnings: bool,
+
+    /// -X lazy_imports, PYTHON_LAZY_IMPORTS: -1 for normal, 1 for all.
+    /// This startup value is independent of later sys.set_lazy_imports() calls.
+    pub lazy_imports: i8,
+
+    /// -i
+    pub inspect: bool,
+
+    /// -i, with no script
+    pub interactive: bool,
+
+    // int optimization_level;
+    // int parser_debug;
+    /// -B
+    pub write_bytecode: bool,
+
+    /// verbosity level (-v switch)
+    pub verbose: u8,
+
+    /// -q
+    pub quiet: bool,
+
+    /// -s
+    pub user_site_directory: bool,
+
+    // int configure_c_stdio;
+    /// -u, PYTHONUNBUFFERED=x
+    pub buffered_stdio: bool,
+
+    /// PYTHONIOENCODING - stdio encoding
+    pub stdio_encoding: Option<String>,
+    /// PYTHONIOENCODING - stdio error handler
+    pub stdio_errors: Option<String>,
+    pub utf8_mode: i8,
+    /// Windows-only legacy filesystem bytes codec (PEP 529).
+    pub legacy_windows_fs_encoding: bool,
+    /// --check-hash-based-pycs
+    pub check_hash_pycs_mode: CheckHashPycsMode,
+
+    /// -X frozen_modules=on|off (bootstrap modules remain available).
+    pub use_frozen_modules: bool,
+    /// -P
+    pub safe_path: bool,
+
+    /// -X int_max_str_digits
+    pub int_max_str_digits: i64,
+
+    /// `-X cpu_count` / `PYTHON_CPU_COUNT` override; `None` leaves the count to the host
+    pub cpu_count: Option<NonZeroI32>,
+
+    // /* --- Path configuration inputs ------------ */
+    // int pathconfig_warnings;
+    // wchar_t *program_name;
+    /// Native PYTHONPATH (and RUSTPYTHONPATH) entries, retained without Unicode loss.
+    pub path_list: Vec<OsString>,
+
+    /// Standalone CLI ._pth path override; embedded applications do not discover these files.
+    pub under_pth: Option<crate::getpath::UnderPth>,
+
+    /// PYTHONHOME: explicit prefix, optionally followed by the exec prefix.
+    pub home: Option<String>,
+    // wchar_t *platlibdir;
+    /// -d command line switch
+    pub debug: u8,
+
+    /// -O optimization switch counter
+    pub optimize: u8,
+
+    /// -E
+    pub ignore_environment: bool,
+
+    /// false for wasm. Not a command-line option
+    pub allow_external_library: bool,
+
+    #[cfg(feature = "flame-it")]
+    pub profile_output: Option<OsString>,
+    #[cfg(feature = "flame-it")]
+    pub profile_format: Option<String>,
+}
+
+#[derive(Debug, Default, Copy, Clone, strum_macros::Display, strum_macros::EnumString)]
+#[strum(serialize_all = "lowercase")]
+pub enum CheckHashPycsMode {
+    #[default]
+    Default,
+    Always,
+    Never,
+}
+
+impl Settings {
+    #[must_use]
+    pub fn with_path(mut self, path: String) -> Self {
+        self.path_list.push(path.into());
+        self
+    }
+}
+
+/// Sensible default settings.
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            debug: 0,
+            inspect: false,
+            interactive: false,
+            optimize: 0,
+            install_signal_handlers: true,
+            user_site_directory: true,
+            import_site: true,
+            use_frozen_modules: true,
+            ignore_environment: false,
+            verbose: 0,
+            quiet: false,
+            write_bytecode: true,
+            safe_path: false,
+            bytes_warning: 0,
+            xoptions: vec![],
+            isolated: false,
+            dev_mode: false,
+            warn_default_encoding: false,
+            thread_inherit_context: false,
+            context_aware_warnings: false,
+            lazy_imports: -1,
+            warnoptions: vec![],
+            path_list: vec![],
+            under_pth: None,
+            home: None,
+            argv: vec![],
+            hash_seed: None,
+            faulthandler: false,
+            import_time: 0,
+            pycache_prefix: None,
+            code_debug_ranges: true,
+            buffered_stdio: true,
+            check_hash_pycs_mode: CheckHashPycsMode::Default,
+            allow_external_library: cfg!(feature = "importlib"),
+            stdio_encoding: None,
+            stdio_errors: None,
+            utf8_mode: -1,
+            legacy_windows_fs_encoding: false,
+            int_max_str_digits: 4300,
+            cpu_count: None,
+            #[cfg(feature = "flame-it")]
+            profile_output: None,
+            #[cfg(feature = "flame-it")]
+            profile_format: None,
+        }
+    }
+}

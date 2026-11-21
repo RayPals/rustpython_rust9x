@@ -1,0 +1,40 @@
+[target.'cfg(target_env = "msvc")']
+rustflags = "-C link-arg=/STACK:8000000"
+
+# rust-lld otherwise defaults to Windows 6.0, rejected by the Win9x loader.
+# These version fields do not replace an import/API compatibility audit.
+[target.i686-rust9x-windows-msvc]
+rustflags = [
+    "-C", "link-arg=/STACK:8000000",
+    "-C", "link-arg=/SUBSYSTEM:CONSOLE,4.0",
+    "-C", "link-arg=/OSVERSION:4.0",
+]
+
+[target.i586-rust9x-windows-msvc]
+rustflags = [
+    "-C", "link-arg=/STACK:8000000",
+    "-C", "link-arg=/SUBSYSTEM:CONSOLE,4.0",
+    "-C", "link-arg=/OSVERSION:4.0",
+]
+
+[target.'cfg(all(target_os = "windows", not(target_env = "msvc")))']
+rustflags = "-C link-args=-Wl,--stack,8000000"
+
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg=getrandom_backend=\"wasm_js\""]
+
+# Enforce a 1 MB stack limit for WASI targets.
+# (Runaway heap growth is fixed by the smaller DataStack chunk
+# and the size‑optimized wasm‑release profile.)
+
+[target.wasm32-wasip1]
+rustflags = [
+    "-C", "link-arg=-zstack-size=1048576",
+    "-L", "crates/host_env/vendor/wasm32-wasip1",
+    "-l", "wasi-emulated-signal",
+]
+
+[target.wasm32-wasip2]
+rustflags = [
+    "-C", "link-arg=-zstack-size=1048576",
+]

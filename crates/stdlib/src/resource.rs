@@ -1,0 +1,233 @@
+// spell-checker:disable
+
+pub(crate) use resource::module_def;
+
+#[pymodule]
+mod resource {
+    use crate::vm::{
+        PyObject, PyObjectRef, PyResult, TryFromBorrowedObject, VirtualMachine,
+        convert::{ToPyException, ToPyObject},
+        stdlib::_warnings,
+        types::PyStructSequence,
+    };
+    use num_traits::{Signed, ToPrimitive};
+    use rustpython_host_env::resource as host_resource;
+    use std::io;
+
+    #[cfg_attr(target_os = "android", expect(deprecated))]
+    const RLIM_NLIMITS: i32 = cfg_select! {
+        target_os = "android" => host_resource::RLIM_NLIMITS,
+        _ => {
+            // This constant isn't abi-stable across os versions, so we just
+            // pick a high number so we don't get false positive ValueErrors and just bubble up the
+            // EINVAL that get/setrlimit return on an invalid resource
+            256
+        }
+    };
+
+    // TODO: RLIMIT_OFILE,
+    #[pyattr]
+    use host_resource::{
+        RLIM_INFINITY, RLIMIT_AS, RLIMIT_CORE, RLIMIT_CPU, RLIMIT_DATA, RLIMIT_FSIZE,
+        RLIMIT_MEMLOCK, RLIMIT_NOFILE, RLIMIT_NPROC, RLIMIT_RSS, RLIMIT_STACK,
+    };
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "l4re",
+        target_os = "emscripten",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "aix",
+        target_os = "fuchsia",
+        target_os = "cygwin"
+    ))]
+    #[pyattr]
+    use host_resource::{RLIM_SAVED_CUR, RLIM_SAVED_MAX};
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "emscripten"))]
+    #[pyattr]
+    use host_resource::{RLIMIT_MSGQUEUE, RLIMIT_NICE, RLIMIT_RTPRIO, RLIMIT_SIGPENDING};
+    // TODO: I think this is supposed to be defined for all linux_like?
+    #[cfg(target_os = "linux")]
+    #[pyattr]
+    use host_resource::RLIMIT_RTTIME;
+
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "solaris",
+        target_os = "illumos"
+    ))]
+    #[pyattr]
+    use host_resource::RLIMIT_SBSIZE;
+
+    #[cfg(any(target_os = "freebsd", target_os = "solaris", target_os = "illumos"))]
+    #[pyattr]
+    use host_resource::{RLIMIT_NPTS, RLIMIT_SWAP};
+
+    #[cfg(any(target_os = "solaris", target_os = "illumos"))]
+    #[pyattr]
+    use host_resource::RLIMIT_VMEM;
+
+    #[cfg(any(target_os = "linux", target_os = "emscripten", target_os = "freebsd"))]
+    #[pyattr]
+    use host_resource::RUSAGE_THREAD;
+    #[cfg(not(any(target_os = "windows", target_os = "redox")))]
+    #[pyattr]
+    use host_resource::{RUSAGE_CHILDREN, RUSAGE_SELF};
+
+    #[pystruct_sequence_data]
+    struct RUsageData {
+        ru_utime: f64,
+        ru_stime: f64,
+        ru_maxrss: host_resource::c_long,
+        ru_ixrss: host_resource::c_long,
+        ru_idrss: host_resource::c_long,
+        ru_isrss: host_resource::c_long,
+        ru_minflt: host_resource::c_long,
+        ru_majflt: host_resource::c_long,
+        ru_nswap: host_resource::c_long,
+        ru_inblock: host_resource::c_long,
+        ru_oublock: host_resource::c_long,
+        ru_msgsnd: host_resource::c_long,
+        ru_msgrcv: host_resource::c_long,
+        ru_nsignals: host_resource::c_long,
+        ru_nvcsw: host_resource::c_long,
+        ru_nivcsw: host_resource::c_long,
+    }
+
+    #[pyattr]
+    #[pystruct_sequence(name = "struct_rusage", module = "resource", data = "RUsageData")]
+    struct PyRUsage;
+
+    #[pyclass(with(PyStructSequence))]
+    impl PyRUsage {}
+
+    impl From<host_resource::RUsage> for RUsageData {
+        fn from(rusage: host_resource::RUsage) -> Self {
+            Self {
+                ru_utime: rusage.utime_secs(),
+                ru_stime: rusage.stime_secs(),
+                ru_maxrss: rusage.ru_maxrss,
+                ru_ixrss: rusage.ru_ixrss,
+                ru_idrss: rusage.ru_idrss,
+                ru_isrss: rusage.ru_isrss,
+                ru_minflt: rusage.ru_minflt,
+                ru_majflt: rusage.ru_majflt,
+                ru_nswap: rusage.ru_nswap,
+                ru_inblock: rusage.ru_inblock,
+                ru_oublock: rusage.ru_oublock,
+                ru_msgsnd: rusage.ru_msgsnd,
+                ru_msgrcv: rusage.ru_msgrcv,
+                ru_nsignals: rusage.ru_nsignals,
+                ru_nvcsw: rusage.ru_nvcsw,
+                ru_nivcsw: rusage.ru_nivcsw,
+            }
+        }
+    }
+
+    // The exception the module reports its failures through, which is the one
+    // every other call raises.
+    #[pyattr(once)]
+    fn error(vm: &VirtualMachine) -> PyObjectRef {
+        vm.ctx.exceptions.os_error.to_owned().into()
+    }
+
+    #[pyfunction]
+    fn getpagesize() -> usize {
+        rustpython_host_env::os::page_size()
+    }
+
+    #[pyfunction]
+    fn getrusage(who: i32, vm: &VirtualMachine) -> PyResult<RUsageData> {
+        let res = host_resource::getrusage(who);
+        res.map(RUsageData::from).map_err(|e| {
+            if e.kind() == io::ErrorKind::InvalidInput {
+                vm.new_value_error("invalid who parameter")
+            } else {
+                e.to_pyexception(vm)
+            }
+        })
+    }
+
+    struct Limits(host_resource::rlimit);
+
+    impl<'a> TryFromBorrowedObject<'a> for Limits {
+        fn try_from_borrowed_object(vm: &VirtualMachine, obj: &'a PyObject) -> PyResult<Self> {
+            let seq: Vec<PyObjectRef> = obj.try_to_value(vm)?;
+            match seq.as_slice() {
+                [cur, max] => Ok(Self(host_resource::rlimit {
+                    rlim_cur: py2rlim_limit(cur, vm)?,
+                    rlim_max: py2rlim_limit(max, vm)?,
+                })),
+                _ => Err(vm.new_value_error("expected a tuple of 2 integers")),
+            }
+        }
+    }
+
+    impl ToPyObject for Limits {
+        fn to_pyobject(self, vm: &VirtualMachine) -> PyObjectRef {
+            (self.0.rlim_cur, self.0.rlim_max).to_pyobject(vm)
+        }
+    }
+
+    fn py2rlim_limit(obj: &PyObject, vm: &VirtualMachine) -> PyResult<host_resource::rlim_t> {
+        let int = obj.try_index(vm)?;
+        if int.as_bigint().is_negative() {
+            // Only accept the legacy signed representation of RLIM_INFINITY,
+            // not arbitrary negative values truncated to the native width.
+            if let Some(value) = int.as_bigint().to_i128()
+                && value >= -(1_i128 << (host_resource::rlim_t::BITS - 1))
+                && value as host_resource::rlim_t == RLIM_INFINITY
+            {
+                _warnings::warn(
+                    vm.ctx.exceptions.deprecation_warning,
+                    "Use RLIM_INFINITY instead of negative limit value.".to_owned(),
+                    1,
+                    vm,
+                )?;
+                return Ok(RLIM_INFINITY);
+            }
+            return Err(vm.new_value_error("Cannot convert negative int"));
+        }
+        let value = int
+            .try_to_primitive::<u64>(vm)
+            .map_err(|_| vm.new_overflow_error("Python int too large to convert to C rlim_t"))?;
+        host_resource::rlim_t::try_from(value)
+            .map_err(|_| vm.new_overflow_error("Python int too large to convert to C rlim_t"))
+    }
+
+    #[pyfunction]
+    fn getrlimit(resource: i32, vm: &VirtualMachine) -> PyResult<Limits> {
+        if !(0..RLIM_NLIMITS).contains(&resource) {
+            return Err(vm.new_value_error("invalid resource specified"));
+        }
+
+        let rlimit = host_resource::getrlimit(resource as host_resource::rlim_t)
+            .map_err(|e| e.to_pyexception(vm))?;
+        Ok(Limits(rlimit))
+    }
+
+    #[pyfunction]
+    fn setrlimit(resource: i32, limits: PyObjectRef, vm: &VirtualMachine) -> PyResult<()> {
+        if !(0..RLIM_NLIMITS).contains(&resource) {
+            return Err(vm.new_value_error("invalid resource specified"));
+        }
+
+        vm.audit("resource.setrlimit", || (resource, limits.clone()))?;
+        let limits = Limits::try_from_borrowed_object(vm, &limits)?;
+        let res = host_resource::setrlimit(resource as host_resource::rlim_t, limits.0);
+
+        res.map_err(|e| match e.kind() {
+            io::ErrorKind::InvalidInput => {
+                vm.new_value_error("current limit exceeds maximum limit")
+            }
+            io::ErrorKind::PermissionDenied => {
+                vm.new_value_error("not allowed to raise maximum limit")
+            }
+            _ => e.to_pyexception(vm),
+        })
+    }
+}

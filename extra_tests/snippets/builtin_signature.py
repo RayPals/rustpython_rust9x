@@ -1,0 +1,741 @@
+import builtins
+import inspect
+import os
+import sys
+
+from testutils import assert_raises
+
+# __text_signature__ is generated from the Rust parameter list, so it must not
+# describe parameters the function does not actually take, and must mark the
+# ones it does take as positional-only.
+
+# No phantom `module` parameter. The signature marks it as `$module` and
+# `__self__` is the module, so inspect strips it.
+for f in (len, abs, hash, id, repr, bin, ord, divmod, hex, oct, chr, callable):
+    assert "module" not in inspect.signature(f).parameters, f.__name__
+
+# Plain arguments bind through take_positional(), so they are positional-only.
+try:
+    len(obj=[1, 2])
+except TypeError:
+    pass
+else:
+    raise AssertionError("len() should not accept keyword arguments")
+
+assert str(inspect.signature(len)) == "(obj, /)"
+assert str(inspect.signature(abs)) == "(number, /)"
+assert str(inspect.signature(hash)) == "(obj, /)"
+assert str(inspect.signature(chr)) == "(i, /)"
+assert str(inspect.signature(callable)) == "(obj, /)"
+
+assert (
+    inspect.signature(len).parameters["obj"].kind == inspect.Parameter.POSITIONAL_ONLY
+)
+
+# *args/**kwargs cannot be followed by `/`; collector names also match Clinic.
+assert breakpoint.__text_signature__ == "($module, /, *args, **kws)"
+assert str(inspect.signature(breakpoint)) == "(*args, **kws)"
+# Collector names are descriptive, not reserved keyword parameters.
+import sys
+
+original_breakpointhook = sys.breakpointhook
+try:
+    sys.breakpointhook = lambda *args, **kws: (args, kws)
+    assert breakpoint(1, args=2, kws=3, kwargs=4) == (
+        (1,),
+        {"args": 2, "kws": 3, "kwargs": 4},
+    )
+finally:
+    sys.breakpointhook = original_breakpointhook
+breakpoint_kinds = [p.kind for p in inspect.signature(breakpoint).parameters.values()]
+assert breakpoint_kinds == [
+    inspect.Parameter.VAR_POSITIONAL,
+    inspect.Parameter.VAR_KEYWORD,
+], breakpoint_kinds
+
+# Parameter names follow CPython, so signatures are directly comparable.
+assert str(inspect.signature(bin)) == "(integer, /)"
+assert str(inspect.signature(ord)) == "(character, /)"
+assert str(inspect.signature(divmod)) == "(x, y, /)"
+assert str(inspect.signature(hasattr)) == "(obj, name, /)"
+assert str(inspect.signature(setattr)) == "(obj, name, value, /)"
+assert str(inspect.signature(delattr)) == "(obj, name, /)"
+assert str(inspect.signature(isinstance)) == "(obj, class_or_tuple, /)"
+assert str(inspect.signature(issubclass)) == "(cls, class_or_tuple, /)"
+assert str(inspect.signature(aiter)) == "(async_iterable, /)"
+
+# A generated signature is stored in __doc__ and read back out of it, so it
+# needs the `--` terminator even when the function has no documentation.
+assert str(inspect.signature(os.getpid)) == "()"
+assert str(inspect.signature(os.getcwd)) == "()"
+
+# Methods report a signature too, with the receiver marked so that binding a
+# method drops it.
+assert str(inspect.signature(list.__dir__)) == "(self, /)"
+assert str(inspect.signature([].__dir__)) == "()"
+assert str(inspect.signature(float.fromhex)) == "(string, /)"
+
+import _socket
+
+if hasattr(_socket.socket, "sendmsg"):
+    # CPython 3.15.0 used unrepresentable defaults; 3.15.1 corrected them.
+    if sys.implementation.name == "cpython" and sys.version_info[:3] == (3, 15, 0):
+        assert _socket.socket.sendmsg.__text_signature__ == (
+            "($self, buffers, ancdata=<unrepresentable>, flags=0,\n"
+            "        address=<unrepresentable>, /)"
+        )
+        assert_raises(ValueError, inspect.signature, _socket.socket.sendmsg)
+    else:
+        assert _socket.socket.sendmsg.__text_signature__ == (
+            "($self, buffers, ancdata=(), flags=0, address=None, /)"
+        )
+        assert str(inspect.signature(_socket.socket.sendmsg)) == (
+            "(self, buffers, ancdata=(), flags=0, address=None, /)"
+        )
+
+# Functions whose arguments come from a FromArgs struct report the struct's
+# parameters.
+assert round.__text_signature__ == "($module, /, number, ndigits=None)"
+assert sum.__text_signature__ == "($module, iterable, /, start=0)"
+assert str(inspect.signature(round)) == "(number, ndigits=None)"
+assert str(inspect.signature(sum)) == "(iterable, /, start=0)"
+
+# A keyword-only argument between two positional ones used to put `/` after
+# `*`, which inspect cannot parse. Arguments are ordered like CPython's, so
+# path and mode take keywords. Windows renders follow_symlinks differently.
+if hasattr(os, "chmod"):
+    chmod_signature = os.chmod.__text_signature__
+    assert chmod_signature.startswith("($module, /, path, mode, *, dir_fd=None"), (
+        chmod_signature
+    )
+
+# Omitted arguments keep their runtime sentinels while displaying CPython 3.15's
+# public defaults. In particular, an omitted compression dictionary is not None.
+import binascii
+import signal
+import zlib
+
+for f in (binascii.hexlify, binascii.b2a_hex):
+    assert f.__text_signature__ == (
+        "($module, /, data, sep=<unrepresentable>, bytes_per_sep=1)"
+    )
+    assert f(b"abc", b":") == f(b"abc", b":", 1) == b"61:62:63"
+
+if hasattr(signal, "setitimer"):
+    assert signal.setitimer.__text_signature__ == (
+        "($module, which, seconds, interval=0.0, /)"
+    )
+    assert inspect.signature(signal.setitimer).parameters["interval"].default == 0.0
+
+assert " ".join(zlib.compressobj.__text_signature__.split()) == (
+    "($module, /, level=Z_DEFAULT_COMPRESSION, method=DEFLATED, "
+    "wbits=MAX_WBITS, memLevel=DEF_MEM_LEVEL, "
+    "strategy=Z_DEFAULT_STRATEGY, zdict=<unrepresentable>)"
+)
+try:
+    zlib.compressobj(zdict=None)
+except TypeError:
+    pass
+else:
+    raise AssertionError("None is not an omitted compression dictionary")
+
+assert zlib._ZlibDecompressor.__text_signature__ == "(wbits=MAX_WBITS, zdict=b'')"
+assert (
+    inspect.signature(zlib._ZlibDecompressor).parameters["wbits"].default
+    == zlib.MAX_WBITS
+)
+assert zlib._ZlibDecompressor().decompress(zlib.compress(b"signature defaults")) == (
+    b"signature defaults"
+)
+
+# Clinic keeps platform-dependent defaults symbolic rather than hard-coding
+# the 64-bit value. inspect resolves the symbol for the running interpreter.
+import sys
+
+for sequence_type in (list, tuple):
+    assert sequence_type.index.__text_signature__ == (
+        "($self, value, start=0, stop=sys.maxsize, /)"
+    )
+    index_signature = inspect.signature(sequence_type.index)
+    assert index_signature.parameters["stop"].default == sys.maxsize
+
+assert str.maketrans.__text_signature__ == (
+    "(x, y=<unrepresentable>, z=<unrepresentable>, /)"
+)
+
+if hasattr(os, "utime"):
+    # ns is deliberately unrepresentable; only times has a None default.
+    assert " ".join(os.utime.__text_signature__.split()) == (
+        "($module, /, path, times=None, *, ns=<unrepresentable>, "
+        "dir_fd=None, follow_symlinks=True)"
+    )
+
+# Buffered stream constructors retain Clinic's symbolic module default.
+import _io
+
+for stream_type in (_io.BufferedReader, _io.BufferedWriter, _io.BufferedRandom):
+    assert stream_type.__text_signature__ == "(raw, buffer_size=DEFAULT_BUFFER_SIZE)"
+    assert (
+        inspect.signature(stream_type).parameters["buffer_size"].default
+        == _io.DEFAULT_BUFFER_SIZE
+    )
+
+assert _io.BufferedRWPair.__text_signature__ == (
+    "(reader, writer, buffer_size=DEFAULT_BUFFER_SIZE, /)"
+)
+assert (
+    inspect.signature(_io.BufferedRWPair).parameters["buffer_size"].default
+    == _io.DEFAULT_BUFFER_SIZE
+)
+
+# Module defaults retain their symbolic spelling without changing conversion.
+import _codecs
+import _imp
+import _warnings
+import array
+import faulthandler
+import marshal
+import time
+
+assert array.array.index.__text_signature__ == (
+    "($self, v, start=0, stop=sys.maxsize, /)"
+)
+assert _codecs.charmap_decode.__text_signature__ == (
+    "($module, data, errors=None, mapping=None, /)"
+)
+assert _imp.create_dynamic.__text_signature__ == (
+    "($module, spec, file=<unrepresentable>, /)"
+)
+assert " ".join(_warnings.warn_explicit.__text_signature__.split()) == (
+    "($module, /, message, category, filename, lineno, "
+    "module=<unrepresentable>, registry=None, module_globals=None, source=None)"
+)
+assert marshal.dumps.__text_signature__ == (
+    "($module, value, version=version, /, *, allow_code=True)"
+)
+assert marshal.dump.__text_signature__ == (
+    "($module, value, file, version=version, /, *, allow_code=True)"
+)
+assert inspect.signature(marshal.dumps).parameters["version"].default == marshal.version
+assert faulthandler._sigsegv.__text_signature__ == ("($module, release_gil=False, /)")
+assert " ".join(faulthandler.dump_traceback.__text_signature__.split()) == (
+    "($module, /, file=sys.stderr, all_threads=True, *, max_threads=100)"
+)
+if hasattr(faulthandler, "dump_c_stack"):
+    assert (
+        faulthandler.dump_c_stack.__text_signature__ == "($module, /, file=sys.stderr)"
+    )
+
+try:
+    import _blake2
+except ImportError:
+    pass
+else:
+    for hash_type in (_blake2.blake2b, _blake2.blake2s):
+        assert (
+            "digest_size=_blake2." + hash_type.__name__ + ".MAX_DIGEST_SIZE"
+            in hash_type.__text_signature__
+        )
+
+try:
+    import select
+except ImportError:
+    pass
+else:
+    if hasattr(select, "epoll"):
+        assert " ".join(select.epoll.register.__text_signature__.split()) == (
+            "($self, /, fd, eventmask=select.EPOLLIN | select.EPOLLPRI | select.EPOLLOUT)"
+        )
+
+for sequence_type in (os.stat_result, os.terminal_size, time.struct_time):
+    assert sequence_type.__getitem__.__text_signature__ == "($self, key, /)"
+
+# Symbolic defaults and omitted callback contexts carry distinct introspection
+# metadata even when the Rust-side converter is shared with other callables.
+import _asyncio
+import _io
+
+for _future_type in (_asyncio.Future, _asyncio.Task):
+    assert _future_type.add_done_callback.__text_signature__ == (
+        "($self, fn, /, *, context=<unrepresentable>)"
+    )
+    try:
+        inspect.signature(_future_type.add_done_callback)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an omitted context is not a representable default")
+
+assert _io._IOBase.seek.__text_signature__ == ("($self, offset, whence=os.SEEK_SET, /)")
+assert _io.TextIOWrapper.seek.__text_signature__ == (
+    "($self, cookie, whence=os.SEEK_SET, /)"
+)
+assert inspect.signature(_io.TextIOWrapper.seek).parameters["whence"].default == (
+    os.SEEK_SET
+)
+# Other seek methods keep their literal defaults.
+assert _io.BytesIO.seek.__text_signature__ == "($self, pos, whence=0, /)"
+assert _io.BufferedReader.seek.__text_signature__ == "($self, target, whence=0, /)"
+
+# CPython's tp_new_wrapper hides its bound defining type, but still requires
+# the caller to supply the subtype as the first positional argument. The raw
+# signature intentionally has no slash, unlike other slot descriptors.
+new_wrapper_types = (
+    "object",
+    "type",
+    "bool",
+    "bytearray",
+    "bytes",
+    "complex",
+    "dict",
+    "float",
+    "frozenset",
+    "int",
+    "list",
+    "memoryview",
+    "range",
+    "set",
+    "slice",
+    "str",
+    "tuple",
+    "BaseException",
+    "Exception",
+    "ArithmeticError",
+    "AssertionError",
+    "AttributeError",
+    "EOFError",
+    "ImportError",
+    "IndexError",
+    "KeyError",
+    "LookupError",
+    "MemoryError",
+    "NameError",
+    "NotImplementedError",
+    "OSError",
+    "OverflowError",
+    "ReferenceError",
+    "RuntimeError",
+    "StopIteration",
+    "SyntaxError",
+    "SystemError",
+    "SystemExit",
+    "TypeError",
+    "ValueError",
+    "ZeroDivisionError",
+    "Warning",
+    "UserWarning",
+    "RuntimeWarning",
+    "DeprecationWarning",
+    "FutureWarning",
+    "UnicodeError",
+)
+for type_name in new_wrapper_types:
+    cls = getattr(builtins, type_name)
+    new = cls.__new__
+    assert new.__text_signature__ == "($type, *args, **kwargs)", type_name
+    assert str(inspect.signature(new)) == "(*args, **kwargs)", type_name
+    assert isinstance(new.__self__, type), type_name
+
+
+class NewList(list):
+    pass
+
+
+assert NewList.__new__ is list.__new__
+assert NewList.__new__.__self__ is list
+assert dict.__new__(dict, answer=42) == {}
+assert int.__new__(int, "10", base=2) == 2
+# The hidden $type in the raw signature does not make the explicit subtype
+# keyword-bindable. Do not silently alter dispatch when matching its spelling.
+for new, kwargs in ((object.__new__, {"type": object}), (list.__new__, {"cls": list})):
+    try:
+        new(**kwargs)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("the subtype must remain positional")
+# CPython falls back to METH_NOARGS/METH_O signatures for these non-Clinic
+# functions. The hidden marker is $self even though they bind a module.
+import importlib
+
+flags_signatures = {
+    "_ast": {
+        "_is_abstract": "($self, object, /)",
+    },
+    "_codecs_cn": {
+        "getcodec": "($self, object, /)",
+    },
+    "_codecs_hk": {
+        "getcodec": "($self, object, /)",
+    },
+    "_codecs_iso2022": {
+        "getcodec": "($self, object, /)",
+    },
+    "_codecs_jp": {
+        "getcodec": "($self, object, /)",
+    },
+    "_codecs_kr": {
+        "getcodec": "($self, object, /)",
+    },
+    "_codecs_tw": {
+        "getcodec": "($self, object, /)",
+    },
+    "_ctypes": {
+        "Py_DECREF": "($self, object, /)",
+        "Py_INCREF": "($self, object, /)",
+        "alignment": "($self, object, /)",
+        "buffer_info": "($self, object, /)",
+        "dllist": "($self, /)",
+        "get_errno": "($self, /)",
+    },
+    "_interpchannels": {
+        "list_all": "($self, /)",
+    },
+    "_socket": {
+        "close": "($self, object, /)",
+        "dup": "($self, object, /)",
+        "getdefaulttimeout": "($self, /)",
+        "gethostname": "($self, /)",
+        "if_nameindex": "($self, /)",
+        "setdefaulttimeout": "($self, object, /)",
+    },
+    "_stat": {
+        "S_IFMT": "($self, object, /)",
+        "S_IMODE": "($self, object, /)",
+        "S_ISBLK": "($self, object, /)",
+        "S_ISCHR": "($self, object, /)",
+        "S_ISDIR": "($self, object, /)",
+        "S_ISDOOR": "($self, object, /)",
+        "S_ISFIFO": "($self, object, /)",
+        "S_ISLNK": "($self, object, /)",
+        "S_ISPORT": "($self, object, /)",
+        "S_ISREG": "($self, object, /)",
+        "S_ISSOCK": "($self, object, /)",
+        "S_ISWHT": "($self, object, /)",
+        "filemode": "($self, object, /)",
+    },
+    "_string": {
+        "formatter_field_name_split": "($self, object, /)",
+        "formatter_parser": "($self, object, /)",
+    },
+    "_uuid": {
+        "generate_time_safe": "($self, /)",
+    },
+    "time": {
+        "mktime": "($self, object, /)",
+        "monotonic": "($self, /)",
+        "monotonic_ns": "($self, /)",
+        "perf_counter": "($self, /)",
+        "perf_counter_ns": "($self, /)",
+        "process_time": "($self, /)",
+        "process_time_ns": "($self, /)",
+        "sleep": "($self, object, /)",
+        "thread_time": "($self, /)",
+        "thread_time_ns": "($self, /)",
+        "time": "($self, /)",
+        "time_ns": "($self, /)",
+    },
+}
+for module_name, signatures in flags_signatures.items():
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError:
+        # Some native modules are unavailable on WASI or disabled by features.
+        continue
+    for function_name, expected in signatures.items():
+        function = getattr(module, function_name, None)
+        if function is None:
+            # Unix-only symbols are not present on every platform.
+            continue
+        assert function.__text_signature__ == expected, (
+            module_name,
+            function_name,
+            function.__text_signature__,
+        )
+        assert function.__self__ is module, (module_name, function_name)
+        displayed = "(object, /)" if "object" in expected else "()"
+        assert str(inspect.signature(function)) == displayed
+
+# Ordinary Clinic functions keep their module marker and real parameter names.
+assert len.__text_signature__ == "($module, obj, /)"
+# Public positional-only names still matter to signature consumers.
+assert anext.__text_signature__ == (
+    "($module, async_iterator, default=<unrepresentable>, /)"
+)
+assert reversed.__setstate__.__text_signature__ == "($self, object, /)"
+assert str(inspect.signature(reversed.__setstate__)) == "(self, object, /)"
+
+try:
+    import _hashlib
+except ImportError:
+    pass
+else:
+    assert _hashlib.HASHXOF.update.__text_signature__ == "($self, obj, /)"
+    assert str(inspect.signature(_hashlib.HASHXOF.update)) == "(self, obj, /)"
+# Pickle protocol parameters retain the public spelling even when ignored.
+import _io
+
+for pickle_type in (
+    bytes,
+    memoryview,
+    _io.BufferedReader,
+    _io.BufferedWriter,
+    _io.BufferedRandom,
+    _io.TextIOWrapper,
+):
+    reduce_ex = pickle_type.__reduce_ex__
+    assert reduce_ex.__text_signature__ == "($self, protocol, /)"
+    parameters = inspect.signature(reduce_ex).parameters
+    assert list(parameters) == ["self", "protocol"]
+    assert parameters["protocol"].kind == inspect.Parameter.POSITIONAL_ONLY
+# Clinic wraps whole parameter chunks at column 72, including the function
+# name and trailing comma in the width. Preserve the raw spelling, including
+# spaces inside defaults; inspect.signature equivalence alone cannot check it.
+import importlib
+
+clinic_wrapped_signatures = {
+    "builtins": {
+        "__import__": "($module, /, name, globals=None, locals=None, fromlist=(),\n           level=0)",
+        "__lazy_import__": "($module, /, name, globals=None, locals=None,\n                fromlist=(), level=0)",
+        "compile": "($module, /, source, filename, mode, flags=0,\n        dont_inherit=False, optimize=-1, *, module=None,\n        _feature_version=-1)",
+    },
+    "array": {
+        "_array_reconstructor": "($module, arraytype, typecode, mformat_code, items,\n                     /)"
+    },
+    "binascii": {
+        "a2b_ascii85": "($module, data, /, *, foldspaces=False, adobe=False,\n            ignorechars=b'', canonical=False)",
+        "a2b_base32": "($module, data, /, *, padded=True, alphabet=BASE32_ALPHABET,\n           ignorechars=b'', canonical=False)",
+        "a2b_base64": "($module, data, /, *, strict_mode=<unrepresentable>,\n           padded=True, alphabet=BASE64_ALPHABET,\n           ignorechars=<unrepresentable>, canonical=False)",
+        "a2b_base85": "($module, data, /, *, alphabet=BASE85_ALPHABET,\n           ignorechars=b'', canonical=False)",
+        "b2a_ascii85": "($module, data, /, *, foldspaces=False, wrapcol=0,\n            pad=False, adobe=False)",
+        "b2a_base32": "($module, data, /, *, padded=True, wrapcol=0,\n           alphabet=BASE32_ALPHABET)",
+        "b2a_base64": "($module, data, /, *, padded=True, wrapcol=0, newline=True,\n           alphabet=BASE64_ALPHABET)",
+        "b2a_base85": "($module, data, /, *, pad=False, wrapcol=0,\n           alphabet=BASE85_ALPHABET)",
+    },
+    "_codecs": {
+        "utf_16_ex_decode": "($module, data, errors=None, byteorder=0, final=False,\n                 /)",
+        "utf_32_ex_decode": "($module, data, errors=None, byteorder=0, final=False,\n                 /)",
+    },
+    "datetime": {
+        "datetime": "(year, month, day, hour=0, minute=0, second=0, microsecond=0,\n         tzinfo=None, *, fold=0)",
+        "timedelta": "(days=0, seconds=0, microseconds=0, milliseconds=0, minutes=0,\n          hours=0, weeks=0)",
+        "datetime.replace": "($self, /, year=unchanged, month=unchanged, day=unchanged,\n        hour=unchanged, minute=unchanged, second=unchanged,\n        microsecond=unchanged, tzinfo=unchanged, *, fold=unchanged)",
+        "time.replace": "($self, /, hour=unchanged, minute=unchanged, second=unchanged,\n        microsecond=unchanged, tzinfo=unchanged, *, fold=unchanged)",
+    },
+    "_functools": {
+        "reduce": "($module, function, iterable, /,\n       initial=functools._initial_missing)"
+    },
+    "_hashlib": {
+        "openssl_sha224": "($module, /, data=b'', *, usedforsecurity=True,\n               string=None)",
+        "openssl_sha256": "($module, /, data=b'', *, usedforsecurity=True,\n               string=None)",
+        "openssl_sha384": "($module, /, data=b'', *, usedforsecurity=True,\n               string=None)",
+        "openssl_sha3_224": "($module, /, data=b'', *, usedforsecurity=True,\n                 string=None)",
+        "openssl_sha3_256": "($module, /, data=b'', *, usedforsecurity=True,\n                 string=None)",
+        "openssl_sha3_384": "($module, /, data=b'', *, usedforsecurity=True,\n                 string=None)",
+        "openssl_sha3_512": "($module, /, data=b'', *, usedforsecurity=True,\n                 string=None)",
+        "openssl_sha512": "($module, /, data=b'', *, usedforsecurity=True,\n               string=None)",
+        "openssl_shake_128": "($module, /, data=b'', *, usedforsecurity=True,\n                  string=None)",
+        "openssl_shake_256": "($module, /, data=b'', *, usedforsecurity=True,\n                  string=None)",
+        "pbkdf2_hmac": "($module, /, hash_name, password, salt, iterations,\n            dklen=None)",
+    },
+    "_io": {
+        "TextIOWrapper": "(buffer, encoding=None, errors=None, newline=None,\n              line_buffering=False, write_through=False)",
+        "open": "($module, /, file, mode='r', buffering=-1, encoding=None,\n     errors=None, newline=None, closefd=True, opener=None)",
+        "TextIOWrapper.reconfigure": "($self, /, *, encoding=None, errors=None, newline=None,\n            line_buffering=None, write_through=None)",
+    },
+    "_lsprof": {
+        "Profiler._creturn_callback": "($self, code, instruction_offset, callable, self_arg,\n                  /)"
+    },
+    "_pickle": {
+        "Unpickler": "(file, *, fix_imports=True, encoding='ASCII', errors='strict',\n          buffers=())",
+        "dump": "($module, /, obj, file, protocol=None, *, fix_imports=True,\n     buffer_callback=None)",
+        "dumps": "($module, /, obj, protocol=None, *, fix_imports=True,\n      buffer_callback=None)",
+        "load": "($module, /, file, *, fix_imports=True, encoding='ASCII',\n     errors='strict', buffers=())",
+        "loads": "($module, data, /, *, fix_imports=True, encoding='ASCII',\n      errors='strict', buffers=())",
+    },
+    "posix": {
+        "access": "($module, /, path, mode, *, dir_fd=None, effective_ids=False,\n       follow_symlinks=True)",
+        "chmod": "($module, /, path, mode, *, dir_fd=None,\n      follow_symlinks=(os.name != 'nt'))",
+        "copy_file_range": "($module, /, src, dst, count, offset_src=None,\n                offset_dst=None)",
+        "link": "($module, /, src, dst, *, src_dir_fd=None, dst_dir_fd=None,\n     follow_symlinks=(os.name != 'nt'))",
+        "posix_spawn": "($module, path, argv, env, /, *, file_actions=(),\n            setpgroup=None, resetids=False, setsid=False,\n            setsigmask=(), setsigdef=(), scheduler=None)",
+        "posix_spawnp": "($module, path, argv, env, /, *, file_actions=(),\n             setpgroup=None, resetids=False, setsid=False,\n             setsigmask=(), setsigdef=(), scheduler=None)",
+        "register_at_fork": "($module, /, *, before=<unrepresentable>,\n                 after_in_child=<unrepresentable>,\n                 after_in_parent=<unrepresentable>)",
+        "utime": "($module, /, path, times=None, *, ns=<unrepresentable>,\n      dir_fd=None, follow_symlinks=True)",
+    },
+    "_posixsubprocess": {
+        "fork_exec": "($module, args, executable_list, close_fds, pass_fds, cwd,\n          env, p2cread, p2cwrite, c2pread, c2pwrite, errread, errwrite,\n          errpipe_read, errpipe_write, restore_signals, call_setsid,\n          pgid_to_set, gid, extra_groups, uid, child_umask, preexec_fn,\n          /)"
+    },
+    "pyexpat": {
+        "ParserCreate": "($module, /, encoding=None, namespace_separator=None,\n             intern=<unrepresentable>)"
+    },
+    "_remote_debugging": {
+        "BinaryWriter.set_stats": "($self, /, duration_sec, sample_rate, error_rate=None,\n          missed_samples=None)"
+    },
+    "_sre": {
+        "compile": "($module, /, pattern, flags, code, groups, groupindex,\n        indexgroup)"
+    },
+    "_ssl": {
+        "_SSLContext._wrap_bio": "($self, /, incoming, outgoing, server_side,\n          server_hostname=None, *, owner=None, session=None)",
+        "_SSLContext._wrap_socket": "($self, /, sock, server_side, server_hostname=None, *,\n             owner=None, session=None)",
+    },
+    "syslog": {
+        "openlog": "($module, /, ident=<unrepresentable>, logoption=0,\n        facility=LOG_USER)"
+    },
+    "_warnings": {
+        "warn": "($module, /, message, category=None, stacklevel=1, source=None, *,\n     skip_file_prefixes=())"
+    },
+    "zlib": {
+        "compressobj": "($module, /, level=Z_DEFAULT_COMPRESSION, method=DEFLATED,\n            wbits=MAX_WBITS, memLevel=DEF_MEM_LEVEL,\n            strategy=Z_DEFAULT_STRATEGY, zdict=<unrepresentable>)"
+    },
+}
+for module_name, signatures in clinic_wrapped_signatures.items():
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError:
+        # Native modules vary with the platform and build features.
+        continue
+    for attribute_path, expected in signatures.items():
+        if module_name == "posix":
+            if attribute_path == "copy_file_range" and sys.platform != "linux":
+                # copy_file_range is a Linux-only syscall.
+                continue
+            if sys.platform == "wasi" and attribute_path in (
+                "posix_spawn",
+                "posix_spawnp",
+                "register_at_fork",
+            ):
+                # WASI does not provide process creation or fork hooks.
+                continue
+        function = module
+        for component in attribute_path.split("."):
+            function = getattr(function, component)
+        assert function.__text_signature__ == expected, (
+            module_name,
+            attribute_path,
+            function.__text_signature__,
+            expected,
+        )
+
+# Explicit optional groups are public text, not Python parameter-list syntax.
+for sequence_type in (str, bytes, bytearray):
+    value = sequence_type("abc", "ascii") if sequence_type is not str else "abc"
+    needle = sequence_type("b", "ascii") if sequence_type is not str else "b"
+    for method_name in (
+        "count",
+        "find",
+        "index",
+        "rfind",
+        "rindex",
+        "startswith",
+        "endswith",
+    ):
+        parameter = {"startswith": "prefix", "endswith": "suffix"}.get(
+            method_name, "sub"
+        )
+        method = getattr(sequence_type, method_name)
+        assert method.__text_signature__ == f"($self, {parameter}[, start[, end]], /)"
+        bound = getattr(value, method_name)
+        for target in (method, bound):
+            try:
+                inspect.signature(target)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("optional group should not be inspect-parsable")
+        assert bound(needle) == bound(needle, None, None)
+        assert bound(needle, 1) == bound(needle, 1, None)
+        events = []
+
+        class Index:
+            def __init__(self, name, value):
+                self.name, self.value = name, value
+
+            def __index__(self):
+                events.append(self.name)
+                return self.value
+
+        assert bound(needle, Index("start", 0), Index("end", 3)) == bound(needle)
+        assert events == ["start", "end"]
+        for args, kwargs in (
+            ((needle,), {"start": 0}),
+            ((), {}),
+            ((needle, 0, 3, 4), {}),
+        ):
+            try:
+                bound(*args, **kwargs)
+            except TypeError:
+                pass
+            else:
+                raise AssertionError("positional-only argument validation changed")
+
+import _csv
+
+for _function, _first in (
+    (_csv.reader, "iterable"),
+    (_csv.writer, "fileobj"),
+    (_csv.register_dialect, "name"),
+):
+    assert _function.__text_signature__ == (
+        f"($module, {_first}, /, dialect='excel', **fmtparams)"
+    )
+    assert str(inspect.signature(_function)) == (
+        f"({_first}, /, dialect='excel', **fmtparams)"
+    )
+
+
+# Explicit overrides and generated NULL defaults are useful raw metadata even
+# when inspect.Signature cannot represent optional groups or sentinel defaults.
+import collections
+import datetime
+
+for obj, raw, doc in (
+    (
+        collections.deque,
+        "([iterable[, maxlen]])",
+        "A list-like sequence optimized for data accesses near its endpoints.",
+    ),
+    (
+        collections.deque.index,
+        "($self, value, [start, [stop]])",
+        "Return first index of value.\n\n"
+        "Raises ValueError if the value is not present.",
+    ),
+    (
+        collections.deque().index,
+        "($self, value, [start, [stop]])",
+        "Return first index of value.\n\n"
+        "Raises ValueError if the value is not present.",
+    ),
+    (
+        datetime.timezone,
+        "(offset, name=<unrepresentable>)",
+        "Fixed offset from UTC implementation of tzinfo.",
+    ),
+):
+    assert obj.__text_signature__ == raw
+    assert obj.__doc__ == doc
+    try:
+        inspect.signature(obj)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(f"signature should remain unrepresentable: {obj}")
+
+# __prepare__ uses $cls, unlike the $type receiver of most native classmethods.
+# The descriptor and its bound form must expose the same header but strip the
+# bound receiver only from the latter's inspected signature.
+prepare = type.__dict__["__prepare__"]
+assert prepare.__text_signature__ == "($cls, name, bases, /, **kwds)"
+assert str(inspect.signature(prepare)) == "(cls, name, bases, /, **kwds)"
+assert type.__prepare__.__text_signature__ == prepare.__text_signature__
+assert str(inspect.signature(type.__prepare__)) == "(name, bases, /, **kwds)"
+assert type.__prepare__.__doc__ == "Create the namespace for the class statement"
+assert type.__prepare__.__self__ is type
+
+# A display signature must not impose Clinic binding on __prepare__: CPython's
+# implementation ignores every supplied argument and returns a fresh namespace.
+for arguments in ((), (object(),), (object(), object(), object())):
+    namespace = type.__prepare__(*arguments, unexpected=object())
+    assert namespace == {}
+    assert namespace is not type.__prepare__(*arguments, unexpected=object())

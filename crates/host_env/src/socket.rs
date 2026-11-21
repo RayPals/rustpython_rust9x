@@ -1,0 +1,2263 @@
+#[cfg(unix)]
+use crate::os::CheckLibcResult;
+#[cfg(unix)]
+use core::ffi::CStr;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::{io, os::fd::BorrowedFd};
+
+/// Returns the system's hostname.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn hostname() -> std::ffi::OsString {
+    gethostname::gethostname()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use ::dns_lookup as dns;
+#[cfg(not(target_arch = "wasm32"))]
+pub use ::socket2 as raw;
+
+#[cfg(target_os = "linux")]
+pub mod bluetooth;
+
+#[cfg(not(any(
+    target_os = "ios",
+    target_os = "android",
+    target_os = "windows",
+    target_arch = "wasm32",
+    target_os = "redox"
+)))]
+fn select_mac_address(addresses: impl IntoIterator<Item = [u8; 6]>) -> Option<[u8; 6]> {
+    let mut first_local = None;
+
+    for address in addresses {
+        if address == [0; 6] {
+            continue;
+        }
+        if address[0] & 0x02 == 0 {
+            return Some(address);
+        }
+        first_local.get_or_insert(address);
+    }
+
+    first_local
+}
+
+/// Returns a universally administered MAC address when available, otherwise
+/// the first locally administered address, or `None` when lookup fails.
+#[cfg(not(any(
+    target_os = "ios",
+    target_os = "android",
+    target_os = "windows",
+    target_arch = "wasm32",
+    target_os = "redox"
+)))]
+pub fn mac_address() -> Option<[u8; 6]> {
+    let addresses = mac_address::MacAddressIterator::new().ok()?;
+    select_mac_address(addresses.map(|address| address.bytes()))
+}
+
+#[cfg(test)]
+#[cfg(not(any(
+    target_os = "ios",
+    target_os = "android",
+    target_os = "windows",
+    target_arch = "wasm32",
+    target_os = "redox"
+)))]
+mod mac_address_tests {
+    use super::select_mac_address;
+
+    #[test]
+    fn prefers_universally_administered_address() {
+        let local = [0x02, 0, 0, 0, 0, 1];
+        let universal = [0x00, 0, 0, 0, 0, 2];
+
+        assert_eq!(select_mac_address([local, universal]), Some(universal));
+    }
+
+    #[test]
+    fn falls_back_to_first_locally_administered_address() {
+        let first = [0x02, 0, 0, 0, 0, 1];
+        let second = [0x06, 0, 0, 0, 0, 2];
+
+        assert_eq!(select_mac_address([first, second]), Some(first));
+    }
+
+    #[test]
+    fn ignores_zero_address() {
+        let universal = [0x00, 0, 0, 0, 0, 1];
+
+        assert_eq!(select_mac_address([[0; 6], universal]), Some(universal));
+        assert_eq!(select_mac_address([[0; 6]]), None);
+    }
+}
+
+#[cfg(unix)]
+pub use libc::{AF_UNIX, SOCK_STREAM, sa_family_t, sockaddr_storage, socklen_t};
+
+/// Integer names the VM published from `libc as c` on unix. Windows already
+/// takes the overlapping set from this module.
+#[cfg(unix)]
+pub use libc::{
+    AF_INET, AF_INET6, AF_UNSPEC, AI_ADDRCONFIG, AI_CANONNAME, AI_NUMERICHOST, AI_NUMERICSERV,
+    AI_PASSIVE, INADDR_ANY, INADDR_BROADCAST, INADDR_LOOPBACK, INADDR_NONE, IPPROTO_ICMP,
+    IPPROTO_ICMPV6, IPPROTO_IP, IPPROTO_IPV6, IPPROTO_TCP, IPPROTO_UDP, MSG_CTRUNC, MSG_DONTROUTE,
+    MSG_OOB, MSG_PEEK, MSG_TRUNC, MSG_WAITALL, NI_DGRAM, NI_MAXHOST, NI_NAMEREQD, NI_NOFQDN,
+    NI_NUMERICHOST, NI_NUMERICSERV, SHUT_RD, SHUT_RDWR, SHUT_WR, SO_BROADCAST, SO_ERROR,
+    SO_KEEPALIVE, SO_LINGER, SO_OOBINLINE, SO_RCVBUF, SO_REUSEADDR, SO_SNDBUF, SO_TYPE, SOCK_DGRAM,
+    SOL_SOCKET, SOMAXCONN, TCP_NODELAY,
+};
+
+#[cfg(all(unix, not(target_os = "redox")))]
+pub use libc::{
+    AF_APPLETALK, AF_DECnet, AF_IPX, IPPROTO_AH, IPPROTO_DSTOPTS, IPPROTO_EGP, IPPROTO_ESP,
+    IPPROTO_FRAGMENT, IPPROTO_HOPOPTS, IPPROTO_IDP, IPPROTO_IGMP, IPPROTO_IPIP, IPPROTO_NONE,
+    IPPROTO_PIM, IPPROTO_PUP, IPPROTO_RAW, IPPROTO_ROUTING, SOCK_RAW, SOCK_RDM, SOCK_SEQPACKET,
+};
+
+#[cfg(unix)]
+pub use libc::SO_REUSEPORT;
+
+#[cfg(any(unix, target_os = "android"))]
+pub use libc::{
+    EAI_AGAIN, EAI_BADFLAGS, EAI_FAIL, EAI_FAMILY, EAI_MEMORY, EAI_NONAME, EAI_SERVICE,
+    EAI_SOCKTYPE, EAI_SYSTEM, IP_ADD_MEMBERSHIP, IP_DROP_MEMBERSHIP, IP_HDRINCL, IP_MULTICAST_IF,
+    IP_MULTICAST_LOOP, IP_MULTICAST_TTL, IP_TOS, IP_TTL, IPV6_MULTICAST_HOPS, IPV6_MULTICAST_IF,
+    IPV6_MULTICAST_LOOP, IPV6_UNICAST_HOPS, IPV6_V6ONLY, MSG_EOR, SO_ACCEPTCONN, SO_DEBUG,
+    SO_DONTROUTE, SO_RCVLOWAT, SO_RCVTIMEO, SO_SNDLOWAT, SO_SNDTIMEO,
+};
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub use libc::{IP_OPTIONS, IPV6_HOPOPTS, IPV6_RECVRTHDR, IPV6_RTHDR};
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "linux",
+    target_vendor = "apple",
+))]
+pub use libc::IPV6_DONTFRAG;
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "linux",
+    target_vendor = "apple",
+))]
+pub use libc::{IPV6_CHECKSUM, IPV6_HOPLIMIT};
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+    target_os = "linux",
+    target_vendor = "apple",
+))]
+pub use libc::{AI_ALL, AI_V4MAPPED};
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "linux",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_vendor = "apple",
+))]
+pub use libc::EAI_NODATA;
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "linux",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_vendor = "apple",
+))]
+pub use libc::IPV6_PKTINFO;
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+    target_os = "linux",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_vendor = "apple",
+))]
+pub use libc::{IPV6_RECVTCLASS, IPV6_TCLASS};
+
+#[cfg(any(
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_vendor = "apple"
+))]
+pub use libc::{
+    AF_LINK, IP_RECVDSTADDR, IPPROTO_GGP, IPV6_JOIN_GROUP, IPV6_LEAVE_GROUP, SO_USELOOPBACK,
+};
+
+#[cfg(any(
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_vendor = "apple",
+))]
+pub use libc::IPPROTO_ND;
+
+#[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
+pub use libc::{MSG_BCAST, MSG_MCAST};
+
+#[cfg(any(target_os = "netbsd", target_os = "redox", target_vendor = "apple"))]
+pub use libc::NI_MAXSERV;
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "linux",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_vendor = "apple"
+))]
+pub use libc::{
+    AF_ROUTE, AF_SNA, EAI_OVERFLOW, IPPROTO_GRE, IPPROTO_RSVP, IPPROTO_TP, IPV6_RECVPKTINFO,
+    MSG_DONTWAIT, SCM_RIGHTS, TCP_MAXSEG,
+};
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+    target_os = "linux",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "redox"
+))]
+pub use libc::{SOCK_CLOEXEC, SOCK_NONBLOCK};
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+    target_os = "linux",
+    target_os = "netbsd",
+    target_vendor = "apple"
+))]
+pub use libc::{TCP_KEEPCNT, TCP_KEEPINTVL};
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+    target_os = "linux",
+    target_os = "netbsd",
+    target_os = "redox"
+))]
+pub use libc::TCP_KEEPIDLE;
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+    target_os = "linux",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+pub use libc::{MSG_CMSG_CLOEXEC, MSG_NOSIGNAL};
+
+#[cfg(target_vendor = "apple")]
+pub use libc::{
+    AF_SYSTEM, IP_ADD_SOURCE_MEMBERSHIP, IP_BLOCK_SOURCE, IP_DROP_SOURCE_MEMBERSHIP, IP_PKTINFO,
+    IP_RECVTTL, IP_UNBLOCK_SOURCE, IPPROTO_MAX, IPPROTO_SCTP, MSG_NOSIGNAL, PF_SYSTEM,
+    SYSPROTO_CONTROL, TCP_CONNECTION_INFO, TCP_KEEPALIVE,
+};
+
+#[cfg(target_os = "linux")]
+pub use libc::{
+    CAN_BCM, CAN_EFF_FLAG, CAN_EFF_MASK, CAN_ERR_FLAG, CAN_ERR_MASK, CAN_ISOTP, CAN_J1939, CAN_RAW,
+    CAN_RAW_ERR_FILTER, CAN_RAW_FD_FRAMES, CAN_RAW_FILTER, CAN_RAW_JOIN_FILTERS, CAN_RAW_LOOPBACK,
+    CAN_RAW_RECV_OWN_MSGS, CAN_RTR_FLAG, CAN_SFF_MASK, IPPROTO_MPTCP, J1939_IDLE_ADDR,
+    J1939_MAX_UNICAST_ADDR, J1939_NLA_BYTES_ACKED, J1939_NLA_PAD, J1939_NO_ADDR, J1939_NO_NAME,
+    J1939_NO_PGN, J1939_PGN_ADDRESS_CLAIMED, J1939_PGN_ADDRESS_COMMANDED, J1939_PGN_MAX,
+    J1939_PGN_PDU1_MAX, J1939_PGN_REQUEST, SCM_J1939_DEST_ADDR, SCM_J1939_DEST_NAME,
+    SCM_J1939_ERRQUEUE, SCM_J1939_PRIO, SO_J1939_ERRQUEUE, SO_J1939_FILTER, SO_J1939_PROMISC,
+    SO_J1939_SEND_PRIO, SOL_CAN_BASE, SOL_CAN_RAW,
+};
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub use libc::SOL_RDS;
+
+#[cfg(target_os = "android")]
+pub use libc::{SOL_ATALK, SOL_AX25, SOL_IPX, SOL_NETROM, SOL_ROSE};
+
+#[cfg(target_os = "freebsd")]
+pub use libc::SO_SETFIB;
+
+#[cfg(target_os = "netbsd")]
+pub use libc::IPPROTO_VRRP;
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub use libc::{
+    ALG_OP_DECRYPT, ALG_OP_ENCRYPT, ALG_SET_AEAD_ASSOCLEN, ALG_SET_AEAD_AUTHSIZE, ALG_SET_IV,
+    ALG_SET_KEY, ALG_SET_OP, IP_DEFAULT_MULTICAST_LOOP, IP_RECVOPTS, IP_RETOPTS, IPV6_DSTOPTS,
+    IPV6_NEXTHOP, IPV6_PATHMTU, IPV6_RECVDSTOPTS, IPV6_RECVHOPLIMIT, IPV6_RECVHOPOPTS,
+    IPV6_RECVPATHMTU, IPV6_RTHDRDSTOPTS, NETLINK_CRYPTO, NETLINK_DNRTMSG, NETLINK_FIREWALL,
+    NETLINK_IP6_FW, NETLINK_NFLOG, NETLINK_ROUTE, NETLINK_USERSOCK, NETLINK_XFRM, SO_PASSSEC,
+    SO_PEERSEC, SOL_ALG,
+};
+
+#[cfg(any(target_os = "android", target_vendor = "apple"))]
+pub use libc::{AI_DEFAULT, AI_MASK, AI_V4MAPPED_CFG};
+
+#[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+pub use libc::MSG_NOTIFICATION;
+
+#[cfg(any(target_os = "fuchsia", target_os = "linux"))]
+pub use libc::TCP_USER_TIMEOUT;
+
+#[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+pub use libc::{
+    AF_ASH, AF_ATMPVC, AF_ATMSVC, AF_AX25, AF_BRIDGE, AF_ECONET, AF_IRDA, AF_LLC, AF_NETBEUI,
+    AF_NETLINK, AF_NETROM, AF_PACKET, AF_PPPOX, AF_RDS, AF_SECURITY, AF_TIPC, AF_VSOCK, AF_WANPIPE,
+    AF_X25, IP_TRANSPARENT, MSG_CONFIRM, MSG_ERRQUEUE, MSG_FASTOPEN, MSG_MORE, PF_CAN, PF_PACKET,
+    PF_RDS, SCM_CREDENTIALS, SO_BINDTODEVICE, SO_MARK, SOL_IP, SOL_TIPC, SOL_UDP, TCP_CORK,
+    TCP_DEFER_ACCEPT, TCP_LINGER2, TCP_QUICKACK, TCP_SYNCNT, TCP_WINDOW_CLAMP,
+};
+
+#[cfg(any(
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_vendor = "apple"
+))]
+pub use libc::{IPPROTO_HELLO, IPPROTO_XTP, LOCAL_PEERCRED, MSG_EOF};
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "fuchsia",
+    target_os = "freebsd",
+    target_os = "linux"
+))]
+pub use libc::{IPPROTO_UDPLITE, TCP_CONGESTION};
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "fuchsia",
+    target_os = "linux",
+    target_os = "openbsd"
+))]
+pub use libc::AF_KEY;
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "fuchsia",
+    target_os = "linux",
+    target_os = "redox"
+))]
+pub use libc::SO_DOMAIN;
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "fuchsia",
+    all(
+        target_os = "linux",
+        any(
+            target_arch = "aarch64",
+            target_arch = "x86",
+            target_arch = "loongarch64",
+            target_arch = "mips",
+            target_arch = "powerpc",
+            target_arch = "powerpc64",
+            target_arch = "riscv64",
+            target_arch = "s390x",
+            target_arch = "x86_64"
+        )
+    ),
+    target_os = "redox"
+))]
+pub use libc::SO_PRIORITY;
+
+#[cfg(any(
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+pub use libc::IPPROTO_MOBILE;
+
+#[cfg(any(
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_vendor = "apple"
+))]
+pub use libc::SCM_CREDS;
+
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "fuchsia",
+    target_os = "linux",
+    target_vendor = "apple"
+))]
+pub use libc::TCP_FASTOPEN;
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+    all(
+        target_os = "linux",
+        any(
+            target_arch = "aarch64",
+            target_arch = "x86",
+            target_arch = "loongarch64",
+            target_arch = "mips",
+            target_arch = "powerpc",
+            target_arch = "powerpc64",
+            target_arch = "riscv64",
+            target_arch = "s390x",
+            target_arch = "x86_64"
+        )
+    ),
+    target_os = "redox"
+))]
+pub use libc::SO_PROTOCOL;
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "fuchsia",
+    target_os = "linux",
+    target_os = "redox"
+))]
+pub use libc::{SO_PASSCRED, SO_PEERCRED};
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+    target_os = "linux",
+    target_os = "netbsd"
+))]
+pub use libc::TCP_INFO;
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+    target_os = "linux",
+    target_vendor = "apple"
+))]
+pub use libc::IP_RECVTOS;
+
+#[cfg(any(
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_vendor = "apple"
+))]
+pub use libc::{IPPROTO_EON, IPPROTO_IPCOMP};
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+    target_os = "linux",
+    target_os = "netbsd"
+))]
+pub use libc::IPPROTO_SCTP;
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+    target_os = "linux",
+    target_os = "openbsd"
+))]
+pub use libc::AF_BLUETOOTH;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use libc::{AF_ALG, AF_CAN};
+
+// bionic (Android) does not define the CAN/ALG sockaddr structs.
+#[cfg(target_os = "linux")]
+pub use libc::{sockaddr_alg, sockaddr_can};
+
+/// Port numbers some Unix libcs omit. Windows takes `IPPORT_RESERVED` from
+/// WinSock and defines `IPPORT_USERRESERVED` beside the other extras.
+#[cfg(unix)]
+pub const IPPORT_RESERVED: i32 = 1024;
+#[cfg(unix)]
+pub const IPPORT_USERRESERVED: i32 = 5000;
+
+/// Multicast groups as unsigned host-order words. Windows publishes the
+/// same bits as signed C longs (`INADDR_*_GROUP` below).
+#[cfg(unix)]
+pub const INADDR_UNSPEC_GROUP: u32 = 0xe000_0000;
+#[cfg(unix)]
+pub const INADDR_ALLHOSTS_GROUP: u32 = 0xe000_0001;
+#[cfg(unix)]
+pub const INADDR_MAX_LOCAL_GROUP: u32 = 0xe000_00ff;
+
+/// POSIX `<netdb.h>` `NI_MAXSERV`. libc omits it on linux-gnu.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub const NI_MAXSERV: i32 = 32;
+
+/// `<netinet/in.h>` join/leave and routing-header type. libc omits them
+/// on linux-gnu.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub const IPV6_JOIN_GROUP: i32 = 20;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub const IPV6_LEAVE_GROUP: i32 = 21;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub const IPV6_RTHDR_TYPE_0: i32 = 0;
+
+// spell-checker:ignore SETTIMER STARTTIMER COUNTEVT AUTOTIMER
+/// `linux/can/bcm.h` opcodes and flags. Not in libc.
+#[cfg(target_os = "linux")]
+pub const CAN_BCM_TX_SETUP: i32 = 1;
+#[cfg(target_os = "linux")]
+pub const CAN_BCM_TX_DELETE: i32 = 2;
+#[cfg(target_os = "linux")]
+pub const CAN_BCM_TX_READ: i32 = 3;
+#[cfg(target_os = "linux")]
+pub const CAN_BCM_TX_SEND: i32 = 4;
+#[cfg(target_os = "linux")]
+pub const CAN_BCM_RX_SETUP: i32 = 5;
+#[cfg(target_os = "linux")]
+pub const CAN_BCM_RX_DELETE: i32 = 6;
+#[cfg(target_os = "linux")]
+pub const CAN_BCM_RX_READ: i32 = 7;
+#[cfg(target_os = "linux")]
+pub const CAN_BCM_TX_STATUS: i32 = 8;
+#[cfg(target_os = "linux")]
+pub const CAN_BCM_TX_EXPIRED: i32 = 9;
+#[cfg(target_os = "linux")]
+pub const CAN_BCM_RX_STATUS: i32 = 10;
+#[cfg(target_os = "linux")]
+pub const CAN_BCM_RX_TIMEOUT: i32 = 11;
+#[cfg(target_os = "linux")]
+pub const CAN_BCM_RX_CHANGED: i32 = 12;
+#[cfg(target_os = "linux")]
+pub const CAN_BCM_SETTIMER: i32 = 0x0001;
+#[cfg(target_os = "linux")]
+pub const CAN_BCM_STARTTIMER: i32 = 0x0002;
+#[cfg(target_os = "linux")]
+pub const CAN_BCM_TX_COUNTEVT: i32 = 0x0004;
+#[cfg(target_os = "linux")]
+pub const CAN_BCM_TX_ANNOUNCE: i32 = 0x0008;
+#[cfg(target_os = "linux")]
+pub const CAN_BCM_TX_CP_CAN_ID: i32 = 0x0010;
+#[cfg(target_os = "linux")]
+pub const CAN_BCM_RX_FILTER_ID: i32 = 0x0020;
+#[cfg(target_os = "linux")]
+pub const CAN_BCM_RX_CHECK_DLC: i32 = 0x0040;
+#[cfg(target_os = "linux")]
+pub const CAN_BCM_RX_NO_AUTOTIMER: i32 = 0x0080;
+#[cfg(target_os = "linux")]
+pub const CAN_BCM_RX_ANNOUNCE_RESUME: i32 = 0x0100;
+#[cfg(target_os = "linux")]
+pub const CAN_BCM_TX_RESET_MULTI_IDX: i32 = 0x0200;
+#[cfg(target_os = "linux")]
+pub const CAN_BCM_RX_RTR_FRAME: i32 = 0x0400;
+#[cfg(target_os = "linux")]
+pub const CAN_BCM_CAN_FD_FRAME: i32 = 0x0800;
+
+/// `linux/vm_sockets.h`. libc does not bind the vsock sockopt / cid names.
+#[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+pub const SO_VM_SOCKETS_BUFFER_SIZE: u32 = 0;
+#[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+pub const SO_VM_SOCKETS_BUFFER_MIN_SIZE: u32 = 1;
+#[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+pub const SO_VM_SOCKETS_BUFFER_MAX_SIZE: u32 = 2;
+#[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+pub const VMADDR_CID_ANY: u32 = 0xffff_ffff;
+#[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+pub const VMADDR_PORT_ANY: u32 = 0xffff_ffff;
+#[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+pub const VMADDR_CID_HOST: u32 = 2;
+#[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+pub const VM_SOCKETS_INVALID_VERSION: u32 = 0xffff_ffff;
+
+/// `netinet/udplite.h`. libc does not bind the coverage sockopts.
+#[cfg(any(
+    target_os = "android",
+    target_os = "fuchsia",
+    target_os = "freebsd",
+    target_os = "linux"
+))]
+pub const UDPLITE_SEND_CSCOV: i32 = 10;
+#[cfg(any(
+    target_os = "android",
+    target_os = "fuchsia",
+    target_os = "freebsd",
+    target_os = "linux"
+))]
+pub const UDPLITE_RECV_CSCOV: i32 = 11;
+
+/// `SOL_IP` / `SOL_UDP` when libc does not bind them. Linux takes the
+/// header names; Windows takes WinSock `SOL_IP`. Elsewhere they are the
+/// IANA protocol numbers.
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "fuchsia",
+    target_os = "linux",
+    windows
+)))]
+pub const SOL_IP: i32 = 0;
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "fuchsia",
+    target_os = "linux",
+    windows
+)))]
+pub const SOL_UDP: i32 = 17;
+
+/// `SOMAXCONN` when neither libc nor WinSock publishes it.
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+    target_os = "linux",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_vendor = "apple",
+    windows
+)))]
+pub const SOMAXCONN: i32 = 5;
+
+/// Bluetooth wildcard / local addresses. Header strings, not libc names.
+#[cfg(any(
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+    target_os = "linux",
+    target_os = "openbsd"
+))]
+pub const BDADDR_ANY: &str = "00:00:00:00:00:00";
+#[cfg(any(
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+    target_os = "linux",
+    target_os = "openbsd"
+))]
+pub const BDADDR_LOCAL: &str = "00:00:00:FF:FF:FF";
+
+/// RFC 3542 IPv6 socket options (`netinet6/in6.h`). Not in libc.
+#[cfg(target_vendor = "apple")]
+pub const IPV6_RECVHOPLIMIT: i32 = 37;
+#[cfg(target_vendor = "apple")]
+pub const IPV6_RECVRTHDR: i32 = 38;
+#[cfg(target_vendor = "apple")]
+pub const IPV6_RECVHOPOPTS: i32 = 39;
+#[cfg(target_vendor = "apple")]
+pub const IPV6_RECVDSTOPTS: i32 = 40;
+#[cfg(target_vendor = "apple")]
+pub const IPV6_USE_MIN_MTU: i32 = 42;
+#[cfg(target_vendor = "apple")]
+pub const IPV6_RECVPATHMTU: i32 = 43;
+#[cfg(target_vendor = "apple")]
+pub const IPV6_PATHMTU: i32 = 44;
+#[cfg(target_vendor = "apple")]
+pub const IPV6_NEXTHOP: i32 = 48;
+#[cfg(target_vendor = "apple")]
+pub const IPV6_HOPOPTS: i32 = 49;
+#[cfg(target_vendor = "apple")]
+pub const IPV6_DSTOPTS: i32 = 50;
+#[cfg(target_vendor = "apple")]
+pub const IPV6_RTHDR: i32 = 51;
+#[cfg(target_vendor = "apple")]
+pub const IPV6_RTHDRDSTOPTS: i32 = 57;
+#[cfg(target_vendor = "apple")]
+pub const IPV6_RTHDR_TYPE_0: i32 = 0;
+
+/// Darwin `<netdb.h>` `EAI_*` names the libc crate does not re-export.
+#[cfg(target_vendor = "apple")]
+pub const EAI_ADDRFAMILY: i32 = 1;
+#[cfg(target_vendor = "apple")]
+pub const EAI_BADHINTS: i32 = 12;
+#[cfg(target_vendor = "apple")]
+pub const EAI_PROTOCOL: i32 = 13;
+#[cfg(target_vendor = "apple")]
+pub const EAI_MAX: i32 = 15;
+
+/// Set the system's hostname from its filesystem-encoded bytes.
+///
+/// `socketmodule.c socket_sethostname` reads the argument as a buffer and
+/// passes `buf.buf`/`buf.len` straight to the syscall, so a name is not
+/// required to be UTF-8; taking `&[u8]` keeps that true here as well.
+#[cfg(all(unix, not(target_os = "redox")))]
+pub fn sethostname(hostname: &[u8]) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    nix::unistd::sethostname(std::ffi::OsStr::from_bytes(hostname)).map_err(io::Error::from)
+}
+
+#[cfg(unix)]
+pub fn close_socket_ignore_connreset(socket: libc::c_int) -> io::Result<()> {
+    let ret = unsafe { libc::close(socket) };
+    if ret < 0 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ECONNRESET) {
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+pub fn getsockopt_int(fd: libc::c_int, level: i32, name: i32) -> io::Result<i32> {
+    let mut flag: libc::c_int = 0;
+    let mut flagsize = core::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    unsafe {
+        libc::getsockopt(
+            fd,
+            level,
+            name,
+            &mut flag as *mut libc::c_int as *mut _,
+            &mut flagsize,
+        )
+    }
+    .check_libc_neg()?;
+    Ok(flag)
+}
+
+#[cfg(unix)]
+pub fn getsockopt_bytes(
+    fd: libc::c_int,
+    level: i32,
+    name: i32,
+    buflen: usize,
+) -> io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; buflen];
+    let mut optlen = buflen as libc::socklen_t;
+    unsafe { libc::getsockopt(fd, level, name, buf.as_mut_ptr() as *mut _, &mut optlen) }
+        .check_libc_neg()?;
+    buf.truncate(optlen as usize);
+    Ok(buf)
+}
+
+#[cfg(unix)]
+pub fn setsockopt_bytes(fd: libc::c_int, level: i32, name: i32, value: &[u8]) -> io::Result<()> {
+    unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            name,
+            value.as_ptr() as *const _,
+            value.len() as libc::socklen_t,
+        )
+    }
+    .check_libc_neg()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+pub fn setsockopt_int(fd: libc::c_int, level: i32, name: i32, value: i32) -> io::Result<()> {
+    unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            name,
+            &value as *const i32 as *const _,
+            core::mem::size_of::<i32>() as libc::socklen_t,
+        )
+    }
+    .check_libc_neg()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+pub fn setsockopt_none(fd: libc::c_int, level: i32, name: i32, optlen: u32) -> io::Result<()> {
+    unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            name,
+            core::ptr::null(),
+            optlen as libc::socklen_t,
+        )
+    }
+    .check_libc_neg()?;
+    Ok(())
+}
+
+#[cfg(any(
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "netbsd",
+    target_os = "openbsd",
+))]
+pub fn if_nameindex() -> io::Result<Vec<(u32, String)>> {
+    Ok(if_nameindex_bytes()?
+        .into_iter()
+        .map(|(index, name)| (index, String::from_utf8_lossy(&name).into_owned()))
+        .collect())
+}
+
+#[cfg(any(
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "netbsd",
+    target_os = "openbsd",
+))]
+/// Return interface names as their original platform bytes without applying
+/// a lossy text conversion.
+pub fn if_nameindex_bytes() -> io::Result<Vec<(u32, Vec<u8>)>> {
+    let list = nix::net::if_::if_nameindex().map_err(io::Error::from)?;
+    Ok(list
+        .to_slice()
+        .iter()
+        .map(|iface| (iface.index(), iface.name().to_bytes().to_vec()))
+        .collect())
+}
+
+#[cfg(unix)]
+pub fn if_nametoindex_checked(name: &CStr) -> io::Result<u32> {
+    let ret = unsafe { libc::if_nametoindex(name.as_ptr()) };
+    if ret == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(ret)
+    }
+}
+
+#[cfg(unix)]
+pub fn if_indextoname_checked(index: u32) -> io::Result<String> {
+    if_indextoname_bytes(index).map(|name| String::from_utf8_lossy(&name).into_owned())
+}
+
+#[cfg(unix)]
+/// Return an interface name as its original platform bytes.
+pub fn if_indextoname_bytes(index: u32) -> io::Result<Vec<u8>> {
+    let mut buf = [0u8; libc::IF_NAMESIZE];
+    let ret = unsafe {
+        libc::if_indextoname(index as libc::c_uint, buf.as_mut_ptr() as *mut libc::c_char)
+    };
+    if ret.is_null() {
+        Err(io::Error::last_os_error())
+    } else {
+        let buf = unsafe { CStr::from_ptr(buf.as_ptr() as *const libc::c_char) };
+        Ok(buf.to_bytes().to_vec())
+    }
+}
+
+#[cfg(unix)]
+pub fn gai_error_string(err: i32) -> String {
+    unsafe { CStr::from_ptr(libc::gai_strerror(err)) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg(unix)]
+pub fn h_error_string(err: i32) -> String {
+    unsafe { CStr::from_ptr(libc::hstrerror(err)) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg(all(unix, not(target_os = "redox")))]
+#[derive(Debug, Clone)]
+pub struct AncillaryMessage {
+    pub level: i32,
+    pub kind: i32,
+    pub data: Vec<u8>,
+}
+
+#[cfg(all(unix, not(target_os = "redox")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AncillaryDataStatus {
+    /// Every control message in `ancdata` is complete.
+    Complete,
+    /// The last message in `ancdata` holds only the part of its payload that fit.
+    Truncated,
+    /// Parsing stopped at a header that is not included in `ancdata`.
+    Malformed,
+}
+
+#[cfg(all(unix, not(target_os = "redox")))]
+pub type SocketAddressBytes = [u8; core::mem::size_of::<libc::sockaddr_storage>()];
+
+#[cfg(all(unix, not(target_os = "redox")))]
+#[derive(Debug, Clone)]
+pub struct RawSocketAddress {
+    pub storage: SocketAddressBytes,
+    pub len: usize,
+}
+
+#[cfg(all(unix, not(target_os = "redox")))]
+#[derive(Debug, Clone)]
+pub struct RecvMsgResult {
+    pub data: Vec<u8>,
+    pub ancdata: Vec<AncillaryMessage>,
+    pub ancdata_status: AncillaryDataStatus,
+    pub msg_flags: i32,
+    pub address: Option<RawSocketAddress>,
+}
+
+#[cfg(all(unix, not(target_os = "redox")))]
+#[derive(Debug)]
+pub struct RecvMsgIntoResult {
+    pub bytes_read: usize,
+    pub ancdata: Vec<AncillaryMessage>,
+    pub ancdata_status: AncillaryDataStatus,
+    pub msg_flags: i32,
+    pub address: Option<RawSocketAddress>,
+}
+
+// Owned, zero-initialized msg_control storage aligned to 16 bytes.
+#[cfg(all(unix, not(target_os = "redox")))]
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+struct ControlBufferUnit([u8; 16]);
+
+#[cfg(all(unix, not(target_os = "redox")))]
+pub struct ControlBuffer {
+    storage: Vec<ControlBufferUnit>,
+    len: usize,
+}
+
+#[cfg(all(unix, not(target_os = "redox")))]
+impl ControlBuffer {
+    pub fn new(len: usize) -> Option<Self> {
+        const UNIT: usize = 16;
+        let n_units = len.div_ceil(UNIT);
+        let alloc_size = n_units.checked_mul(UNIT)?;
+        if isize::try_from(alloc_size).is_err() {
+            return None;
+        }
+        Some(Self {
+            storage: vec![ControlBufferUnit([0; UNIT]); n_units],
+            len,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.storage.as_mut_ptr().cast()
+    }
+}
+
+#[cfg(all(unix, not(target_os = "redox")))]
+impl core::ops::Deref for ControlBuffer {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        // SAFETY: `storage` is zero-initialized and contains at least `len` bytes.
+        unsafe { core::slice::from_raw_parts(self.storage.as_ptr().cast(), self.len) }
+    }
+}
+
+#[cfg(all(unix, not(target_os = "redox")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AncillaryPackError {
+    ItemTooLarge,
+    TooMuchData,
+    UnexpectedNullFirstHeader,
+    UnexpectedNullNextHeader,
+    ItemSizeOutOfRange,
+    DoesNotFit,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub enum AfAlgControlError {
+    UnexpectedNullFirstHeader,
+    UnexpectedNullNextHeaderIv,
+    UnexpectedNullNextHeaderAssoc,
+    NoMemory,
+}
+
+#[cfg(all(unix, not(target_os = "redox")))]
+pub const SOCKLEN_T_LIMIT: usize = i32::MAX as usize;
+
+#[cfg(all(unix, not(target_os = "redox")))]
+pub fn checked_cmsg_len(len: usize) -> Option<usize> {
+    let cmsg_len = |length| unsafe { libc::CMSG_LEN(length) };
+    if len as u64 > (SOCKLEN_T_LIMIT as u64 - cmsg_len(0) as u64) {
+        return None;
+    }
+    let res = cmsg_len(len as _) as usize;
+    if res > SOCKLEN_T_LIMIT || res < len {
+        return None;
+    }
+    Some(res)
+}
+
+#[cfg(all(unix, not(target_os = "redox")))]
+pub fn checked_cmsg_space(len: usize) -> Option<usize> {
+    let cmsg_space = |length| unsafe { libc::CMSG_SPACE(length) };
+    if len as u64 > (SOCKLEN_T_LIMIT as u64 - cmsg_space(1) as u64) {
+        return None;
+    }
+    let res = cmsg_space(len as _) as usize;
+    if res > SOCKLEN_T_LIMIT || res < len {
+        return None;
+    }
+    Some(res)
+}
+
+#[cfg(all(unix, not(target_os = "redox")))]
+fn cmsg_min_space(msg: &libc::msghdr, cmsgh: *mut libc::cmsghdr, mut space: usize) -> bool {
+    if cmsgh.is_null() || msg.msg_control.is_null() {
+        return false;
+    }
+    #[allow(
+        clippy::useless_conversion,
+        reason = "msg_controllen is not usize on all platforms"
+    )]
+    let Some(controllen) = usize::try_from(msg.msg_controllen).ok() else {
+        return false;
+    };
+    // SAFETY: `cmsghdr` contains only integer fields; zero is a valid bit pattern.
+    let dummy: libc::cmsghdr = unsafe { core::mem::zeroed() };
+    let cmsg_len_end =
+        core::mem::offset_of!(libc::cmsghdr, cmsg_len) + core::mem::size_of_val(&dummy.cmsg_len);
+    if space < cmsg_len_end {
+        space = cmsg_len_end;
+    }
+    let cmsg_offset = cmsgh.addr().wrapping_sub(msg.msg_control.addr());
+    cmsg_offset <= usize::MAX - space && cmsg_offset + space <= controllen
+}
+
+#[cfg(all(unix, not(target_os = "redox")))]
+fn get_cmsg_data_space(msg: &libc::msghdr, cmsgh: *mut libc::cmsghdr, space: &mut usize) -> bool {
+    // SAFETY: `cmsgh` is a control header associated with `msg`.
+    let data_ptr = unsafe { libc::CMSG_DATA(cmsgh) };
+    if data_ptr.is_null() {
+        return false;
+    }
+    let data_offset = data_ptr.addr().wrapping_sub(msg.msg_control.addr());
+    #[allow(
+        clippy::useless_conversion,
+        reason = "msg_controllen is not usize on all platforms"
+    )]
+    let Some(controllen) = usize::try_from(msg.msg_controllen).ok() else {
+        return false;
+    };
+    if data_offset > controllen {
+        return false;
+    }
+    *space = controllen - data_offset;
+    true
+}
+
+/// Returns -1 if `cmsgh` is invalid, 0 if its payload is fully contained, and 1
+/// if only part of the payload is in the buffer. `data_len` is the contained
+/// payload length when the result is 0 or 1.
+#[cfg(all(unix, not(target_os = "redox")))]
+fn get_cmsg_data_len(msg: &libc::msghdr, cmsgh: *mut libc::cmsghdr, data_len: &mut usize) -> i32 {
+    // SAFETY: `CMSG_LEN` is a length macro over integer fields.
+    let cmsg_len_0 = unsafe { libc::CMSG_LEN(0) };
+    if !cmsg_min_space(msg, cmsgh, cmsg_len_0 as usize) {
+        return -1;
+    }
+    // SAFETY: `cmsg_min_space` with `CMSG_LEN(0)` confirmed the `cmsg_len`
+    // field lies in the control buffer.
+    let cmsg_len = unsafe { (*cmsgh).cmsg_len };
+    if (cmsg_len as u64) < (cmsg_len_0 as u64) {
+        return -1;
+    }
+    let cmsg_data_len = (cmsg_len as u64 - cmsg_len_0 as u64) as usize;
+    let mut space = 0usize;
+    if !get_cmsg_data_space(msg, cmsgh, &mut space) {
+        return -1;
+    }
+    if space >= cmsg_data_len {
+        *data_len = cmsg_data_len;
+        0
+    } else {
+        *data_len = space;
+        1
+    }
+}
+
+/// Walk `CMSG_FIRSTHDR` / `CMSG_NXTHDR` on the `msghdr` returned by recvmsg.
+#[cfg(all(unix, not(target_os = "redox")))]
+fn parse_ancillary_from_msg(msg: &libc::msghdr) -> (Vec<AncillaryMessage>, AncillaryDataStatus) {
+    let mut result = Vec::new();
+    // POSIX allows a signed `msg_controllen`; skip `CMSG_FIRSTHDR` when empty.
+    #[allow(
+        clippy::useless_conversion,
+        reason = "msg_controllen is not usize on all platforms"
+    )]
+    let has_control = usize::try_from(msg.msg_controllen).is_ok_and(|n| n > 0);
+    let mut cmsgh = if has_control {
+        // SAFETY: `msg.msg_control` is the aligned control buffer of
+        // `msg.msg_controllen` bytes filled by recvmsg or a pack helper.
+        unsafe { libc::CMSG_FIRSTHDR(msg) }
+    } else {
+        core::ptr::null_mut()
+    };
+    while !cmsgh.is_null() {
+        let mut cmsgdatalen = 0usize;
+        let cmsg_status = get_cmsg_data_len(msg, cmsgh, &mut cmsgdatalen);
+        if cmsg_status < 0 {
+            return (result, AncillaryDataStatus::Malformed);
+        }
+        // SAFETY: status 0 or 1 means `CMSG_DATA` and `cmsgdatalen` bytes lie
+        // in the control buffer, and the header fields are readable.
+        let (level, kind, data) = unsafe {
+            let src = libc::CMSG_DATA(cmsgh);
+            (
+                (*cmsgh).cmsg_level,
+                (*cmsgh).cmsg_type,
+                core::slice::from_raw_parts(src, cmsgdatalen).to_vec(),
+            )
+        };
+        result.push(AncillaryMessage { level, kind, data });
+        if cmsg_status != 0 {
+            return (result, AncillaryDataStatus::Truncated);
+        }
+        // SAFETY: `cmsgh` came from `CMSG_FIRSTHDR`/`CMSG_NXTHDR` on `msg`.
+        cmsgh = unsafe { libc::CMSG_NXTHDR(msg, cmsgh) };
+    }
+    (result, AncillaryDataStatus::Complete)
+}
+
+#[cfg(all(unix, not(target_os = "redox")))]
+pub fn pack_ancillary_messages(
+    cmsgs: &[(i32, i32, &[u8])],
+) -> Result<ControlBuffer, AncillaryPackError> {
+    use core::{mem, ptr};
+
+    let controllen = cmsgs
+        .iter()
+        .map(|(_, _, buf)| buf.len())
+        .try_fold(0usize, |sum, len| {
+            let space = checked_cmsg_space(len).ok_or(AncillaryPackError::ItemTooLarge)?;
+            match usize::checked_add(sum, space) {
+                Some(next) if next <= SOCKLEN_T_LIMIT => Ok(next),
+                _ => Err(AncillaryPackError::TooMuchData),
+            }
+        })?;
+
+    let mut control_buf = ControlBuffer::new(controllen).ok_or(AncillaryPackError::TooMuchData)?;
+
+    // SAFETY: `msghdr` is a POD of pointers and integers; zero is a valid bit pattern.
+    let mut msg = unsafe { mem::zeroed::<libc::msghdr>() };
+    msg.msg_control = control_buf.as_mut_ptr().cast();
+    msg.msg_controllen = controllen as _;
+
+    let mut cmsgh: *mut libc::cmsghdr = ptr::null_mut();
+    for (i, (lvl, typ, data)) in cmsgs.iter().enumerate() {
+        // SAFETY: `msg.msg_control` points at `control_buf`'s aligned, zeroed
+        // storage of `msg.msg_controllen` bytes. After the first header,
+        // `cmsgh` is a previous CMSG_* result in that buffer; remaining
+        // bytes stay zero so CMSG_NXTHDR can inspect the next header.
+        cmsgh = unsafe {
+            if i == 0 {
+                libc::CMSG_FIRSTHDR(&msg)
+            } else {
+                libc::CMSG_NXTHDR(&msg, cmsgh)
+            }
+        };
+        if cmsgh.is_null() {
+            return Err(if i == 0 {
+                AncillaryPackError::UnexpectedNullFirstHeader
+            } else {
+                AncillaryPackError::UnexpectedNullNextHeader
+            });
+        }
+        let msg_len = checked_cmsg_len(data.len()).ok_or(AncillaryPackError::ItemSizeOutOfRange)?;
+        let enough_space = if cmsg_min_space(&msg, cmsgh, msg_len) {
+            // SAFETY: `cmsg_min_space` confirmed `cmsgh` lies in the control
+            // buffer with room for the `cmsg_len` field.
+            unsafe {
+                #[allow(
+                    clippy::unnecessary_cast,
+                    reason = "cmsg_len is not usize on all platforms"
+                )]
+                {
+                    (*cmsgh).cmsg_len = msg_len as _;
+                }
+            }
+            let mut space = 0usize;
+            get_cmsg_data_space(&msg, cmsgh, &mut space) && space >= data.len()
+        } else {
+            false
+        };
+        if !enough_space {
+            return Err(AncillaryPackError::DoesNotFit);
+        }
+        // SAFETY: `enough_space` means the header and `data.len()` payload
+        // bytes fit in the control buffer. `CMSG_DATA` yields the payload
+        // pointer for this header.
+        unsafe {
+            (*cmsgh).cmsg_level = *lvl;
+            (*cmsgh).cmsg_type = *typ;
+            ptr::copy_nonoverlapping(data.as_ptr(), libc::CMSG_DATA(cmsgh), data.len());
+        }
+    }
+
+    Ok(control_buf)
+}
+
+#[cfg(test)]
+#[cfg(all(unix, not(target_os = "redox")))]
+mod ancillary_parse_tests {
+    use super::{
+        AncillaryDataStatus, ControlBuffer, checked_cmsg_len, pack_ancillary_messages,
+        parse_ancillary_from_msg, recvmsg,
+    };
+    use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+
+    fn msghdr_for_control(control: &ControlBuffer) -> libc::msghdr {
+        // SAFETY: `msghdr` is a POD of pointers and integers.
+        let mut msg = unsafe { core::mem::zeroed::<libc::msghdr>() };
+        msg.msg_control = control.as_ptr() as *mut _;
+        msg.msg_controllen = control.len() as _;
+        msg
+    }
+
+    #[test]
+    fn parses_packed_messages_from_msghdr() {
+        let packed = pack_ancillary_messages(&[
+            (1, 2, b"".as_slice()),
+            (7, 8, b"abc".as_slice()),
+            (9, 10, b"z".as_slice()),
+        ])
+        .unwrap();
+        let msg = msghdr_for_control(&packed);
+        let (messages, status) = parse_ancillary_from_msg(&msg);
+        assert_eq!(status, AncillaryDataStatus::Complete);
+        assert_eq!(messages.len(), 3);
+        assert_eq!((messages[0].level, messages[0].kind), (1, 2));
+        assert!(messages[0].data.is_empty());
+        assert_eq!((messages[1].level, messages[1].kind), (7, 8));
+        assert_eq!(messages[1].data.as_slice(), b"abc");
+        assert_eq!((messages[2].level, messages[2].kind), (9, 10));
+        assert_eq!(messages[2].data.as_slice(), b"z");
+    }
+
+    #[test]
+    fn truncated_payload_returns_truncated() {
+        let packed = pack_ancillary_messages(&[(1, 2, b"abcdef".as_slice())]).unwrap();
+        let data_offset = checked_cmsg_len(0).unwrap();
+        let mut msg = msghdr_for_control(&packed);
+        msg.msg_controllen = (data_offset + 2) as _;
+        let (messages, status) = parse_ancillary_from_msg(&msg);
+        assert_eq!(status, AncillaryDataStatus::Truncated);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].data.as_slice(), b"ab");
+    }
+
+    #[test]
+    fn undersized_cmsg_len_returns_malformed() {
+        let mut packed = pack_ancillary_messages(&[(1, 2, b"x".as_slice())]).unwrap();
+        // SAFETY: `msghdr` is a POD of pointers and integers.
+        let mut msg = unsafe { core::mem::zeroed::<libc::msghdr>() };
+        msg.msg_control = packed.as_mut_ptr().cast();
+        msg.msg_controllen = packed.len() as _;
+        // SAFETY: `CMSG_FIRSTHDR` returns the packed header in `packed`.
+        let cmsgh = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+        assert!(!cmsgh.is_null());
+        // SAFETY: `cmsgh` is the aligned first header in `packed`.
+        unsafe {
+            (*cmsgh).cmsg_len = 1;
+        }
+        let (messages, status) = parse_ancillary_from_msg(&msg);
+        assert_eq!(status, AncillaryDataStatus::Malformed);
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn recvmsg_round_trips_scm_rights() {
+        let mut pair = [0i32; 2];
+        // SAFETY: `pair` has room for two descriptors.
+        let rc =
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, pair.as_mut_ptr()) };
+        assert_eq!(rc, 0);
+        // SAFETY: `socketpair` filled both slots with owned descriptors.
+        let send = unsafe { OwnedFd::from_raw_fd(pair[0]) };
+        let recv = unsafe { OwnedFd::from_raw_fd(pair[1]) };
+
+        let mut payload = [0i32; 2];
+        // SAFETY: `payload` has room for the read and write ends.
+        let rc = unsafe { libc::pipe(payload.as_mut_ptr()) };
+        assert_eq!(rc, 0);
+        // SAFETY: `pipe` filled both slots with owned descriptors.
+        let pipe_r = unsafe { OwnedFd::from_raw_fd(payload[0]) };
+        let pipe_w = unsafe { OwnedFd::from_raw_fd(payload[1]) };
+
+        let fd_bytes = pipe_r.as_raw_fd().to_ne_bytes();
+        let packed =
+            pack_ancillary_messages(&[(libc::SOL_SOCKET, libc::SCM_RIGHTS, fd_bytes.as_slice())])
+                .unwrap();
+
+        let mut iov_buf = *b"x";
+        let mut iov = [libc::iovec {
+            iov_base: iov_buf.as_mut_ptr().cast(),
+            iov_len: 1,
+        }];
+        // SAFETY: `msghdr` is a POD of pointers and integers.
+        let mut msg = unsafe { core::mem::zeroed::<libc::msghdr>() };
+        msg.msg_iov = iov.as_mut_ptr();
+        msg.msg_iovlen = 1;
+        msg.msg_control = packed.as_ptr() as *mut _;
+        msg.msg_controllen = packed.len() as _;
+        // SAFETY: `iov` and `packed` live until `sendmsg` returns.
+        let n = unsafe { libc::sendmsg(send.as_raw_fd(), &msg, 0) };
+        assert!(n >= 0);
+
+        let result = recvmsg(recv.as_fd(), 16, packed.len() + 64, 0).unwrap();
+        assert_eq!(result.data.as_slice(), b"x");
+        assert_eq!(result.ancdata_status, AncillaryDataStatus::Complete);
+        assert_eq!(result.ancdata.len(), 1);
+        assert_eq!(result.ancdata[0].level, libc::SOL_SOCKET);
+        assert_eq!(result.ancdata[0].kind, libc::SCM_RIGHTS);
+        let received = i32::from_ne_bytes(result.ancdata[0].data[..4].try_into().unwrap());
+        assert!(received >= 0);
+        // SAFETY: recvmsg transferred this descriptor.
+        drop(unsafe { OwnedFd::from_raw_fd(received) });
+        drop(pipe_w);
+    }
+}
+
+#[cfg(test)]
+#[cfg(all(unix, not(target_os = "redox")))]
+mod ancillary_pack_tests {
+    use super::{
+        AncillaryDataStatus, ControlBuffer, pack_ancillary_messages, parse_ancillary_from_msg,
+    };
+
+    #[test]
+    fn packs_messages_aligned_and_round_trips() {
+        let packed = pack_ancillary_messages(&[
+            (1, 2, b"".as_slice()),
+            (7, 8, b"abc".as_slice()),
+            (9, 10, b"z".as_slice()),
+        ])
+        .unwrap();
+        assert!((packed.as_ptr() as usize).is_multiple_of(16));
+        // SAFETY: `msghdr` is a POD of pointers and integers.
+        let mut msg = unsafe { core::mem::zeroed::<libc::msghdr>() };
+        msg.msg_control = packed.as_ptr() as *mut _;
+        msg.msg_controllen = packed.len() as _;
+        let (messages, status) = parse_ancillary_from_msg(&msg);
+        assert_eq!(status, AncillaryDataStatus::Complete);
+        assert_eq!(messages.len(), 3);
+        assert_eq!((messages[0].level, messages[0].kind), (1, 2));
+        assert!(messages[0].data.is_empty());
+        assert_eq!((messages[1].level, messages[1].kind), (7, 8));
+        assert_eq!(messages[1].data.as_slice(), b"abc");
+        assert_eq!((messages[2].level, messages[2].kind), (9, 10));
+        assert_eq!(messages[2].data.as_slice(), b"z");
+    }
+
+    #[test]
+    fn pack_empty_input_is_empty() {
+        let packed = pack_ancillary_messages(&[]).unwrap();
+        assert!(packed.is_empty());
+    }
+
+    #[test]
+    fn control_buffer_rejects_overflow_len() {
+        assert!(ControlBuffer::new(usize::MAX).is_none());
+    }
+}
+
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+mod sendmsg_afalg_tests {
+    use super::pack_sendmsg_afalg;
+
+    #[test]
+    fn packs_op_iv_and_assoc_headers() {
+        let iv = b"iviv";
+        let mut packed = pack_sendmsg_afalg(1, Some(iv.as_slice()), Some(4)).unwrap();
+        // SAFETY: `msghdr` is a POD of pointers and integers.
+        let mut msg = unsafe { core::mem::zeroed::<libc::msghdr>() };
+        msg.msg_control = packed.as_mut_ptr().cast();
+        msg.msg_controllen = packed.len() as _;
+        // SAFETY: `packed` is an aligned, zeroed control buffer.
+        let first = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+        assert!(!first.is_null());
+        // SAFETY: `first` is the OP header in `packed`.
+        unsafe {
+            assert_eq!((*first).cmsg_level, libc::SOL_ALG);
+            assert_eq!((*first).cmsg_type, libc::ALG_SET_OP);
+            assert_eq!((*first).cmsg_len, libc::CMSG_LEN(4) as _);
+            assert_eq!(libc::CMSG_DATA(first).cast::<u32>().read(), 1);
+        }
+        // SAFETY: `first` is a CMSG header in `packed`.
+        let iv_hdr = unsafe { libc::CMSG_NXTHDR(&msg, first) };
+        assert!(!iv_hdr.is_null());
+        let iv_payload = core::mem::size_of::<u32>() + iv.len();
+        // SAFETY: `iv_hdr` is the IV header in `packed`.
+        unsafe {
+            assert_eq!((*iv_hdr).cmsg_type, libc::ALG_SET_IV);
+            assert_eq!((*iv_hdr).cmsg_len, libc::CMSG_SPACE(iv_payload as _) as _);
+            assert_eq!(
+                libc::CMSG_DATA(iv_hdr).cast::<u32>().read(),
+                iv.len() as u32
+            );
+        }
+        // SAFETY: `iv_hdr` is a CMSG header in `packed`.
+        let assoc = unsafe { libc::CMSG_NXTHDR(&msg, iv_hdr) };
+        assert!(!assoc.is_null());
+        // SAFETY: `assoc` is the assoclen header in `packed`.
+        unsafe {
+            assert_eq!((*assoc).cmsg_type, libc::ALG_SET_AEAD_ASSOCLEN);
+            assert_eq!((*assoc).cmsg_len, libc::CMSG_LEN(4) as _);
+            assert_eq!(libc::CMSG_DATA(assoc).cast::<u32>().read(), 4);
+        }
+    }
+}
+
+#[cfg(all(unix, not(target_os = "redox")))]
+pub fn recvmsg(
+    fd: BorrowedFd<'_>,
+    bufsize: usize,
+    ancbufsize: usize,
+    flags: i32,
+) -> io::Result<RecvMsgResult> {
+    use core::mem::MaybeUninit;
+
+    // MSG_TRUNC on Linux TCP can report consumed bytes without writing data.
+    let initial = if flags & libc::MSG_TRUNC != 0 {
+        MaybeUninit::new(0)
+    } else {
+        MaybeUninit::uninit()
+    };
+    let mut data_buf = vec![initial; bufsize];
+    let result = recvmsg_into(fd, &mut [&mut data_buf], ancbufsize, flags)?;
+    let data = unsafe {
+        // Datagram MSG_TRUNC may report more bytes than the supplied storage.
+        data_buf.set_len(result.bytes_read.min(bufsize));
+        core::mem::transmute::<Vec<MaybeUninit<u8>>, Vec<u8>>(data_buf)
+    };
+    Ok(RecvMsgResult {
+        data,
+        ancdata: result.ancdata,
+        ancdata_status: result.ancdata_status,
+        msg_flags: result.msg_flags,
+        address: result.address,
+    })
+}
+
+#[cfg(all(unix, not(target_os = "redox")))]
+pub fn recvmsg_into(
+    fd: BorrowedFd<'_>,
+    buffers: &mut [&mut [core::mem::MaybeUninit<u8>]],
+    ancbufsize: usize,
+    flags: i32,
+) -> io::Result<RecvMsgIntoResult> {
+    use core::mem::MaybeUninit;
+
+    let as_iovec = |buf: &mut [MaybeUninit<u8>]| libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    let mut single;
+    let mut multiple;
+    let iov: &mut [libc::iovec] = if let [buf] = buffers {
+        single = [as_iovec(buf)];
+        &mut single
+    } else {
+        multiple = buffers
+            .iter_mut()
+            .map(|buf| as_iovec(buf))
+            .collect::<Vec<_>>();
+        &mut multiple
+    };
+    let mut anc_buf = ControlBuffer::new(ancbufsize)
+        .ok_or_else(|| io::Error::from(io::ErrorKind::OutOfMemory))?;
+    let mut addr_storage: libc::sockaddr_storage = unsafe { core::mem::zeroed() };
+    let mut msg: libc::msghdr = unsafe { core::mem::zeroed() };
+    msg.msg_name = (&mut addr_storage as *mut libc::sockaddr_storage).cast();
+    msg.msg_namelen = core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    msg.msg_iov = iov.as_mut_ptr();
+    // These msghdr fields are narrower on some Unix targets.
+    #[allow(clippy::useless_conversion)]
+    let iovlen = iov
+        .len()
+        .try_into()
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    msg.msg_iovlen = iovlen;
+    if ancbufsize > 0 {
+        msg.msg_control = anc_buf.as_mut_ptr().cast();
+        #[allow(clippy::useless_conversion)]
+        let controllen = ancbufsize
+            .try_into()
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        msg.msg_controllen = controllen;
+    }
+
+    // SAFETY: all iovecs refer to disjoint writable slices; the control and address
+    // buffers are aligned and live until the syscall returns.
+    let ret = unsafe { libc::recvmsg(fd.as_raw_fd(), &mut msg, flags) }.check_libc_neg()?;
+    let (ancdata, ancdata_status) = parse_ancillary_from_msg(&msg);
+    let address = if msg.msg_namelen > 0 {
+        let storage = unsafe {
+            core::mem::transmute::<libc::sockaddr_storage, SocketAddressBytes>(addr_storage)
+        };
+        Some(RawSocketAddress {
+            storage,
+            len: msg.msg_namelen as usize,
+        })
+    } else {
+        None
+    };
+    Ok(RecvMsgIntoResult {
+        bytes_read: ret as usize,
+        ancdata,
+        ancdata_status,
+        msg_flags: msg.msg_flags,
+        address,
+    })
+}
+
+/// Build the AF_ALG control buffer: OP, then optional IV, then optional assoclen.
+#[cfg(target_os = "linux")]
+pub fn pack_sendmsg_afalg(
+    op: u32,
+    iv: Option<&[u8]>,
+    assoclen: Option<u32>,
+) -> Result<ControlBuffer, AfAlgControlError> {
+    use core::mem;
+
+    // SAFETY: `CMSG_SPACE` is a length macro over integer fields.
+    let word_space = unsafe { libc::CMSG_SPACE(4) } as usize;
+    let mut controllen = word_space;
+    if let Some(iv) = iv {
+        let iv_payload = mem::size_of::<u32>()
+            .checked_add(iv.len())
+            .ok_or(AfAlgControlError::NoMemory)?;
+        // SAFETY: `CMSG_SPACE` is a length macro over integer fields.
+        let iv_space = unsafe { libc::CMSG_SPACE(iv_payload as _) } as usize;
+        controllen = controllen
+            .checked_add(iv_space)
+            .ok_or(AfAlgControlError::NoMemory)?;
+    }
+    if assoclen.is_some() {
+        controllen = controllen
+            .checked_add(word_space)
+            .ok_or(AfAlgControlError::NoMemory)?;
+    }
+
+    let mut control_buf = ControlBuffer::new(controllen).ok_or(AfAlgControlError::NoMemory)?;
+
+    // SAFETY: `msghdr` is a POD of pointers and integers; zero is a valid bit pattern.
+    let mut msg = unsafe { mem::zeroed::<libc::msghdr>() };
+    msg.msg_control = control_buf.as_mut_ptr().cast();
+    msg.msg_controllen = controllen as _;
+
+    // SAFETY: `msg.msg_control` points at `control_buf`'s aligned, zeroed
+    // storage of `msg.msg_controllen` bytes.
+    let mut header = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+    if header.is_null() {
+        return Err(AfAlgControlError::UnexpectedNullFirstHeader);
+    }
+    // SAFETY: `CMSG_FIRSTHDR` returned a header in the zeroed control buffer.
+    unsafe {
+        (*header).cmsg_level = libc::SOL_ALG;
+        (*header).cmsg_type = libc::ALG_SET_OP;
+        (*header).cmsg_len = libc::CMSG_LEN(4) as _;
+        libc::CMSG_DATA(header).cast::<u32>().write(op);
+    }
+
+    if let Some(iv) = iv {
+        // SAFETY: `header` is a previous CMSG_* result in the zeroed buffer.
+        header = unsafe { libc::CMSG_NXTHDR(&msg, header) };
+        if header.is_null() {
+            return Err(AfAlgControlError::UnexpectedNullNextHeaderIv);
+        }
+        let iv_payload = mem::size_of::<u32>()
+            .checked_add(iv.len())
+            .ok_or(AfAlgControlError::NoMemory)?;
+        // SAFETY: `CMSG_NXTHDR` returned the IV header in the control buffer.
+        unsafe {
+            (*header).cmsg_level = libc::SOL_ALG;
+            (*header).cmsg_type = libc::ALG_SET_IV;
+            (*header).cmsg_len = libc::CMSG_SPACE(iv_payload as _) as _;
+            let data = libc::CMSG_DATA(header);
+            data.cast::<u32>().write(iv.len() as u32);
+            core::ptr::copy_nonoverlapping(iv.as_ptr(), data.add(mem::size_of::<u32>()), iv.len());
+        }
+    }
+
+    if let Some(assoclen) = assoclen {
+        // SAFETY: `header` is a previous CMSG_* result in the zeroed buffer.
+        header = unsafe { libc::CMSG_NXTHDR(&msg, header) };
+        if header.is_null() {
+            return Err(AfAlgControlError::UnexpectedNullNextHeaderAssoc);
+        }
+        // SAFETY: `CMSG_NXTHDR` returned the assoclen header in the control buffer.
+        unsafe {
+            (*header).cmsg_level = libc::SOL_ALG;
+            (*header).cmsg_type = libc::ALG_SET_AEAD_ASSOCLEN;
+            (*header).cmsg_len = libc::CMSG_LEN(4) as _;
+            libc::CMSG_DATA(header).cast::<u32>().write(assoclen);
+        }
+    }
+
+    Ok(control_buf)
+}
+
+#[cfg(windows)]
+use core::{ffi::CStr, ptr::NonNull};
+#[cfg(windows)]
+use rustpython_wtf8::Wtf8Buf;
+#[cfg(windows)]
+use std::io;
+#[cfg(windows)]
+use windows_sys::Win32::{
+    NetworkManagement::{
+        IpHelper::{
+            ConvertInterfaceLuidToNameW, FreeMibTable, GetIfTable2Ex, MIB_IF_ROW2, MIB_IF_TABLE2,
+            MibIfTableRaw, if_indextoname, if_nametoindex,
+        },
+        Ndis::{IF_MAX_STRING_SIZE, NET_LUID_LH},
+    },
+    Networking::WinSock::{
+        FROM_PROTOCOL_INFO, SOCKET, WSA_FLAG_OVERLAPPED, WSADuplicateSocketW, WSAGetLastError,
+        WSAIoctl, WSAPROTOCOL_INFOW, WSASocketW,
+    },
+};
+
+#[cfg(windows)]
+pub use windows_sys::Win32::Networking::WinSock::{
+    AF_APPLETALK, AF_DECnet, AF_IPX, AF_LINK, AI_ADDRCONFIG, AI_ALL, AI_CANONNAME, AI_NUMERICSERV,
+    AI_V4MAPPED, FIONBIO, INADDR_ANY, INADDR_BROADCAST, INADDR_LOOPBACK, INADDR_NONE,
+    INVALID_SOCKET, IP_ADD_MEMBERSHIP, IP_DROP_MEMBERSHIP, IP_HDRINCL, IP_MULTICAST_IF,
+    IP_MULTICAST_LOOP, IP_MULTICAST_TTL, IP_OPTIONS, IP_RECVDSTADDR, IP_TOS, IP_TTL,
+    IPPORT_RESERVED, IPPROTO_AH, IPPROTO_CBT, IPPROTO_DSTOPTS, IPPROTO_EGP, IPPROTO_ESP,
+    IPPROTO_FRAGMENT, IPPROTO_GGP, IPPROTO_HOPOPTS, IPPROTO_ICLFXBM, IPPROTO_ICMP, IPPROTO_ICMPV6,
+    IPPROTO_IDP, IPPROTO_IGMP, IPPROTO_IGP, IPPROTO_IP, IPPROTO_IP as IPPROTO_IPIP, IPPROTO_IPV4,
+    IPPROTO_IPV6, IPPROTO_L2TP, IPPROTO_MAX, IPPROTO_ND, IPPROTO_NONE, IPPROTO_PGM, IPPROTO_PIM,
+    IPPROTO_PUP, IPPROTO_RAW, IPPROTO_RDP, IPPROTO_ROUTING, IPPROTO_SCTP, IPPROTO_ST, IPPROTO_TCP,
+    IPPROTO_UDP, IPV6_CHECKSUM, IPV6_DONTFRAG, IPV6_HOPLIMIT, IPV6_HOPOPTS, IPV6_JOIN_GROUP,
+    IPV6_LEAVE_GROUP, IPV6_MULTICAST_HOPS, IPV6_MULTICAST_IF, IPV6_MULTICAST_LOOP, IPV6_PKTINFO,
+    IPV6_RECVRTHDR, IPV6_RECVTCLASS, IPV6_RTHDR, IPV6_TCLASS, IPV6_UNICAST_HOPS, IPV6_V6ONLY,
+    MSG_BCAST, MSG_CTRUNC, MSG_DONTROUTE, MSG_MCAST, MSG_OOB, MSG_PEEK, MSG_TRUNC, MSG_WAITALL,
+    NI_DGRAM, NI_MAXHOST, NI_MAXSERV, NI_NAMEREQD, NI_NOFQDN, NI_NUMERICHOST, NI_NUMERICSERV,
+    POLLIN, RCVALL_IPLEVEL, RCVALL_OFF, RCVALL_ON, RCVALL_SOCKETLEVELONLY, SD_BOTH,
+    SD_BOTH as SHUT_RDWR, SD_RECEIVE, SD_RECEIVE as SHUT_RD, SD_SEND, SD_SEND as SHUT_WR,
+    SIO_KEEPALIVE_VALS, SIO_LOOPBACK_FAST_PATH, SIO_RCVALL, SO_ACCEPTCONN, SO_BROADCAST, SO_DEBUG,
+    SO_DONTROUTE, SO_ERROR, SO_KEEPALIVE, SO_LINGER, SO_OOBINLINE, SO_RCVBUF, SO_RCVTIMEO,
+    SO_REUSEADDR, SO_SNDBUF, SO_SNDTIMEO, SO_TYPE, SO_USELOOPBACK, SOCK_DGRAM, SOCK_RAW, SOCK_RDM,
+    SOCK_SEQPACKET, SOCK_STREAM, SOCKET_ERROR, SOCKET_ERROR as SOCKET_ERROR_CODE, SOL_IP,
+    SOL_SOCKET, TCP_MAXSEG, TCP_NODELAY, WSAEBADF, WSAECONNABORTED, WSAECONNRESET, WSAEINTR,
+    WSAENOTSOCK, WSAEWOULDBLOCK, getprotobyname, getservbyname, getservbyport, getsockopt,
+    setsockopt,
+};
+
+#[cfg(windows)]
+pub const SO_EXCLUSIVEADDRUSE: i32 = -5;
+#[cfg(windows)]
+pub const EAI_MEMORY: i32 = windows_sys::Win32::Networking::WinSock::WSA_NOT_ENOUGH_MEMORY;
+#[cfg(windows)]
+pub const EAI_FAMILY: i32 = windows_sys::Win32::Networking::WinSock::WSAEAFNOSUPPORT;
+#[cfg(windows)]
+pub const EAI_BADFLAGS: i32 = windows_sys::Win32::Networking::WinSock::WSAEINVAL;
+#[cfg(windows)]
+pub const EAI_SOCKTYPE: i32 = windows_sys::Win32::Networking::WinSock::WSAESOCKTNOSUPPORT;
+#[cfg(windows)]
+pub const EAI_NODATA: i32 = windows_sys::Win32::Networking::WinSock::WSAHOST_NOT_FOUND;
+#[cfg(windows)]
+pub const EAI_NONAME: i32 = windows_sys::Win32::Networking::WinSock::WSAHOST_NOT_FOUND;
+#[cfg(windows)]
+pub const EAI_FAIL: i32 = windows_sys::Win32::Networking::WinSock::WSANO_RECOVERY;
+#[cfg(windows)]
+pub const EAI_AGAIN: i32 = windows_sys::Win32::Networking::WinSock::WSATRY_AGAIN;
+#[cfg(windows)]
+pub const EAI_SERVICE: i32 = windows_sys::Win32::Networking::WinSock::WSATYPE_NOT_FOUND;
+#[cfg(windows)]
+pub const IF_NAMESIZE: usize = IF_MAX_STRING_SIZE as usize;
+#[cfg(windows)]
+pub const AF_UNSPEC: i32 = windows_sys::Win32::Networking::WinSock::AF_UNSPEC as i32;
+#[cfg(windows)]
+pub const AF_INET: i32 = windows_sys::Win32::Networking::WinSock::AF_INET as i32;
+#[cfg(windows)]
+pub const AF_INET6: i32 = windows_sys::Win32::Networking::WinSock::AF_INET6 as i32;
+#[cfg(windows)]
+pub const AI_PASSIVE: i32 = windows_sys::Win32::Networking::WinSock::AI_PASSIVE as i32;
+#[cfg(windows)]
+pub const AI_NUMERICHOST: i32 = windows_sys::Win32::Networking::WinSock::AI_NUMERICHOST as i32;
+#[cfg(windows)]
+pub const FROM_PROTOCOL_INFO_VALUE: i32 = FROM_PROTOCOL_INFO;
+
+/// `winsock2.h` `SOMAXCONN`. windows-sys still exports the Winsock 1.1 value 5.
+#[cfg(windows)]
+pub const SOMAXCONN: i32 = 0x7fff_ffff;
+
+/// Signed C-long readings of option words, plus names the Winsock headers
+/// do not define that the module still carries.
+#[cfg(windows)]
+pub const SOL_TCP: i32 = 6;
+#[cfg(windows)]
+pub const SOL_UDP: i32 = 17;
+#[cfg(windows)]
+pub const SOL_RFCOMM: i32 = 3;
+#[cfg(windows)]
+pub const SO_SNDLOWAT: i32 = 0x1003;
+#[cfg(windows)]
+pub const SO_RCVLOWAT: i32 = 0x1004;
+#[cfg(windows)]
+pub const SO_ORIGINAL_DST: i32 = 12303;
+#[cfg(windows)]
+pub const SO_BTH_ENCRYPT: i32 = 2;
+#[cfg(windows)]
+pub const SO_BTH_MTU: i32 = 0x8000_0007u32 as i32;
+#[cfg(windows)]
+pub const SO_BTH_MTU_MAX: i32 = 0x8000_0008u32 as i32;
+#[cfg(windows)]
+pub const SO_BTH_MTU_MIN: i32 = 0x8000_000au32 as i32;
+#[cfg(windows)]
+pub const TCP_KEEPIDLE: i32 = 3;
+#[cfg(windows)]
+pub const TCP_FASTOPEN: i32 = 15;
+#[cfg(windows)]
+pub const TCP_KEEPCNT: i32 = 16;
+#[cfg(windows)]
+pub const TCP_KEEPINTVL: i32 = 17;
+#[cfg(windows)]
+pub const IPPORT_USERRESERVED: i32 = 5000;
+#[cfg(windows)]
+pub const INADDR_UNSPEC_GROUP: i32 = 0xe000_0000u32 as i32;
+#[cfg(windows)]
+pub const INADDR_ALLHOSTS_GROUP: i32 = 0xe000_0001u32 as i32;
+#[cfg(windows)]
+pub const INADDR_MAX_LOCAL_GROUP: i32 = 0xe000_00ffu32 as i32;
+#[cfg(windows)]
+pub const IP_ADD_SOURCE_MEMBERSHIP: i32 = 15;
+#[cfg(windows)]
+pub const IP_DROP_SOURCE_MEMBERSHIP: i32 = 16;
+#[cfg(windows)]
+pub const IP_BLOCK_SOURCE: i32 = 17;
+#[cfg(windows)]
+pub const IP_UNBLOCK_SOURCE: i32 = 18;
+#[cfg(windows)]
+pub const IP_PKTINFO: i32 = 19;
+#[cfg(windows)]
+pub const IP_RECVTTL: i32 = 21;
+#[cfg(windows)]
+pub const IP_RECVTOS: i32 = 40;
+#[cfg(windows)]
+pub const IP_RECVERR: i32 = 75;
+#[cfg(windows)]
+pub const IPV6_RECVERR: i32 = 75;
+#[cfg(windows)]
+pub const MSG_ERRQUEUE: i32 = 0x1000;
+#[cfg(windows)]
+pub const RCVALL_MAX: i32 = 3;
+#[cfg(windows)]
+pub const BDADDR_ANY: &str = "00:00:00:00:00:00";
+#[cfg(windows)]
+pub const BDADDR_LOCAL: &str = "00:00:00:FF:FF:FF";
+
+#[cfg(windows)]
+pub type RawSocket = SOCKET;
+
+#[cfg(windows)]
+pub const INVALID_RAW_SOCKET: RawSocket = INVALID_SOCKET as RawSocket;
+
+#[cfg(windows)]
+#[repr(C)]
+pub struct TcpKeepalive {
+    pub onoff: u32,
+    pub keepalivetime: u32,
+    pub keepaliveinterval: u32,
+}
+
+#[cfg(windows)]
+pub struct SharedSocket {
+    pub raw: RawSocket,
+    pub family: i32,
+    pub socket_type: i32,
+    pub protocol: i32,
+}
+
+#[cfg(windows)]
+pub fn last_socket_error() -> io::Error {
+    io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
+}
+
+#[cfg(windows)]
+pub fn set_socket_inheritable(socket: RawSocket, inheritable: bool) -> io::Result<()> {
+    crate::nt::set_handle_inheritable(socket as _, inheritable)
+}
+
+#[cfg(windows)]
+pub fn close_socket_ignore_connreset(socket: RawSocket) -> io::Result<()> {
+    let ret = unsafe { windows_sys::Win32::Networking::WinSock::closesocket(socket) };
+    if ret != 0 {
+        let err = last_socket_error();
+        if err.raw_os_error() != Some(WSAECONNRESET) {
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn getsockopt_int(socket: RawSocket, level: i32, name: i32) -> io::Result<i32> {
+    let mut flag = 0i32;
+    let mut optlen = core::mem::size_of::<i32>() as i32;
+    let ret = unsafe {
+        getsockopt(
+            socket,
+            level,
+            name,
+            &mut flag as *mut i32 as *mut _,
+            &mut optlen,
+        )
+    };
+    if ret == SOCKET_ERROR {
+        Err(crate::os::errno_io_error())
+    } else {
+        Ok(flag)
+    }
+}
+
+#[cfg(windows)]
+pub fn getsockopt_bytes(
+    socket: RawSocket,
+    level: i32,
+    name: i32,
+    buflen: usize,
+) -> io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; buflen];
+    let mut optlen = buflen as i32;
+    let ret = unsafe { getsockopt(socket, level, name, buf.as_mut_ptr() as *mut _, &mut optlen) };
+    if ret == SOCKET_ERROR {
+        Err(crate::os::errno_io_error())
+    } else {
+        buf.truncate(optlen as usize);
+        Ok(buf)
+    }
+}
+
+#[cfg(windows)]
+pub fn setsockopt_bytes(socket: RawSocket, level: i32, name: i32, value: &[u8]) -> io::Result<()> {
+    let ret = unsafe {
+        setsockopt(
+            socket,
+            level,
+            name,
+            value.as_ptr() as *const _,
+            value.len() as i32,
+        )
+    };
+    if ret == SOCKET_ERROR {
+        Err(crate::os::errno_io_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+pub fn setsockopt_int(socket: RawSocket, level: i32, name: i32, value: i32) -> io::Result<()> {
+    let ret = unsafe {
+        setsockopt(
+            socket,
+            level,
+            name,
+            &value as *const i32 as *const _,
+            core::mem::size_of::<i32>() as i32,
+        )
+    };
+    if ret == SOCKET_ERROR {
+        Err(crate::os::errno_io_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+pub fn setsockopt_none(socket: RawSocket, level: i32, name: i32, optlen: u32) -> io::Result<()> {
+    let ret = unsafe { setsockopt(socket, level, name, core::ptr::null(), optlen as i32) };
+    if ret == SOCKET_ERROR {
+        Err(crate::os::errno_io_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+pub fn protocol_info_size() -> usize {
+    core::mem::size_of::<WSAPROTOCOL_INFOW>()
+}
+
+#[cfg(windows)]
+pub fn socket_from_share_data(bytes: &[u8]) -> io::Result<SharedSocket> {
+    let mut info: WSAPROTOCOL_INFOW = unsafe { core::mem::zeroed() };
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            &mut info as *mut WSAPROTOCOL_INFOW as *mut u8,
+            protocol_info_size(),
+        );
+    }
+
+    let raw = unsafe {
+        WSASocketW(
+            FROM_PROTOCOL_INFO,
+            FROM_PROTOCOL_INFO,
+            FROM_PROTOCOL_INFO,
+            &info,
+            0,
+            WSA_FLAG_OVERLAPPED,
+        )
+    };
+    if raw == INVALID_SOCKET {
+        return Err(last_socket_error());
+    }
+
+    crate::nt::set_handle_inheritable(raw as _, false)?;
+
+    Ok(SharedSocket {
+        raw,
+        family: info.iAddressFamily,
+        socket_type: info.iSocketType,
+        protocol: info.iProtocol,
+    })
+}
+
+#[cfg(windows)]
+pub fn share_socket(socket: RawSocket, process_id: u32) -> io::Result<Vec<u8>> {
+    let mut info = core::mem::MaybeUninit::<WSAPROTOCOL_INFOW>::uninit();
+    let ret = unsafe { WSADuplicateSocketW(socket, process_id, info.as_mut_ptr()) };
+    if ret == SOCKET_ERROR {
+        return Err(last_socket_error());
+    }
+    let info = unsafe { info.assume_init() };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            &info as *const WSAPROTOCOL_INFOW as *const u8,
+            core::mem::size_of::<WSAPROTOCOL_INFOW>(),
+        )
+    };
+    Ok(bytes.to_vec())
+}
+
+#[cfg(windows)]
+pub fn ioctl_u32(socket: RawSocket, cmd: u32, option: u32) -> io::Result<u32> {
+    let mut recv = 0u32;
+    let ret = unsafe {
+        WSAIoctl(
+            socket,
+            cmd,
+            &option as *const u32 as *const _,
+            core::mem::size_of::<u32>() as u32,
+            core::ptr::null_mut(),
+            0,
+            &mut recv,
+            core::ptr::null_mut(),
+            None,
+        )
+    };
+    if ret == SOCKET_ERROR {
+        Err(last_socket_error())
+    } else {
+        Ok(recv)
+    }
+}
+
+#[cfg(windows)]
+pub fn ioctl_keepalive(socket: RawSocket, keepalive: TcpKeepalive) -> io::Result<u32> {
+    let mut recv = 0u32;
+    let ret = unsafe {
+        WSAIoctl(
+            socket,
+            windows_sys::Win32::Networking::WinSock::SIO_KEEPALIVE_VALS,
+            &keepalive as *const TcpKeepalive as *const _,
+            core::mem::size_of::<TcpKeepalive>() as u32,
+            core::ptr::null_mut(),
+            0,
+            &mut recv,
+            core::ptr::null_mut(),
+            None,
+        )
+    };
+    if ret == SOCKET_ERROR {
+        Err(last_socket_error())
+    } else {
+        Ok(recv)
+    }
+}
+
+#[cfg(windows)]
+pub fn if_nametoindex_checked(name: &CStr) -> io::Result<u32> {
+    crate::os::set_errno(libc::ENODEV);
+    let ret = unsafe { if_nametoindex(name.as_ptr() as _) };
+    if ret == 0 {
+        Err(crate::os::errno_io_error())
+    } else {
+        Ok(ret)
+    }
+}
+
+#[cfg(windows)]
+pub fn if_indextoname_checked(index: u32) -> io::Result<String> {
+    let mut buf = [0; IF_MAX_STRING_SIZE as usize + 1];
+    crate::os::set_errno(libc::ENXIO);
+    let ret = unsafe { if_indextoname(index, buf.as_mut_ptr()) };
+    if ret.is_null() {
+        Err(crate::os::errno_io_error())
+    } else {
+        let buf = unsafe { CStr::from_ptr(buf.as_ptr() as _) };
+        Ok(buf.to_string_lossy().into_owned())
+    }
+}
+
+/// `PyUnicode_FromWideChar` / `Py_BuildValue("Iu")`: a LUID name is kept as
+/// WTF-8, so an unpaired surrogate is not replaced with U+FFFD.
+#[cfg(windows)]
+fn if_name_from_wide(buf: &[u16]) -> Wtf8Buf {
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Wtf8Buf::from_wide(&buf[..len])
+}
+
+#[cfg(windows)]
+pub fn if_nameindex() -> io::Result<Vec<(u32, Wtf8Buf)>> {
+    fn get_name(luid: &NET_LUID_LH) -> io::Result<Wtf8Buf> {
+        let mut buf = [0u16; IF_MAX_STRING_SIZE as usize + 1];
+        let ret = unsafe { ConvertInterfaceLuidToNameW(luid, buf.as_mut_ptr(), buf.len()) };
+        if ret != 0 {
+            return Err(io::Error::from_raw_os_error(ret as i32));
+        }
+        Ok(if_name_from_wide(&buf))
+    }
+
+    struct MibTable {
+        ptr: NonNull<MIB_IF_TABLE2>,
+    }
+
+    impl MibTable {
+        fn get_raw() -> io::Result<Self> {
+            let mut ptr = core::ptr::null_mut();
+            let ret = unsafe { GetIfTable2Ex(MibIfTableRaw, &mut ptr) };
+            if ret == 0 {
+                let ptr = unsafe { NonNull::new_unchecked(ptr) };
+                Ok(Self { ptr })
+            } else {
+                Err(io::Error::from_raw_os_error(ret as i32))
+            }
+        }
+
+        fn as_slice(&self) -> &[MIB_IF_ROW2] {
+            unsafe {
+                let p = self.ptr.as_ptr();
+                let ptr = &raw const (*p).Table as *const MIB_IF_ROW2;
+                core::slice::from_raw_parts(ptr, (*p).NumEntries as usize)
+            }
+        }
+    }
+
+    impl Drop for MibTable {
+        fn drop(&mut self) {
+            unsafe { FreeMibTable(self.ptr.as_ptr() as *mut _) };
+        }
+    }
+
+    let table = MibTable::get_raw()?;
+    table
+        .as_slice()
+        .iter()
+        .map(|entry| Ok((entry.InterfaceIndex, get_name(&entry.InterfaceLuid)?)))
+        .collect()
+}
+
+#[cfg(test)]
+#[cfg(windows)]
+mod if_name_from_wide_tests {
+    use super::if_name_from_wide;
+    use rustpython_wtf8::Wtf8Buf;
+
+    #[test]
+    fn keeps_unpaired_surrogate() {
+        let units = [b'e' as u16, 0xD800, 0];
+        let name = if_name_from_wide(&units);
+        assert_eq!(name, Wtf8Buf::from_wide(&[b'e' as u16, 0xD800]));
+        assert_ne!(
+            name.as_bytes(),
+            String::from_utf16_lossy(&[b'e' as u16, 0xD800]).as_bytes()
+        );
+    }
+}
+
+/// `UuidFromStringW`. The status is the RPC code, not `GetLastError`.
+#[cfg(windows)]
+pub fn uuid_from_string_w(wide: &widestring::WideCStr) -> Result<windows_sys::core::GUID, u32> {
+    let mut guid = windows_sys::core::GUID {
+        data1: 0,
+        data2: 0,
+        data3: 0,
+        data4: [0; 8],
+    };
+    let status =
+        unsafe { windows_sys::Win32::System::Rpc::UuidFromStringW(wide.as_ptr(), &mut guid) };
+    if status == windows_sys::Win32::System::Rpc::RPC_S_OK {
+        Ok(guid)
+    } else {
+        Err(status as u32)
+    }
+}
+
+/// `UuidToStringW` / `RpcStringFreeW`.
+#[cfg(windows)]
+pub fn uuid_to_string_w(guid: &windows_sys::core::GUID) -> Result<String, u32> {
+    use windows_sys::Win32::System::Rpc::{RPC_S_OK, RpcStringFreeW, UuidToStringW};
+    let mut raw = core::ptr::null_mut();
+    let status = unsafe { UuidToStringW(guid, &mut raw) };
+    if status != RPC_S_OK {
+        return Err(status as u32);
+    }
+    let mut len = 0usize;
+    unsafe {
+        while *raw.add(len) != 0 {
+            len += 1;
+        }
+    }
+    let text = String::from_utf16_lossy(unsafe { core::slice::from_raw_parts(raw, len) });
+    unsafe { RpcStringFreeW(&mut raw) };
+    Ok(text)
+}
+
+/// Address families the Windows SDK exposes beyond the older MSVC census.
+#[cfg(windows)]
+pub const AF_SNA: i32 = 11;
+#[cfg(windows)]
+pub const AF_IRDA: i32 = 26;
+#[cfg(windows)]
+pub const AF_HYPERV: i32 = windows_sys::Win32::Networking::WinSock::AF_HYPERV as i32;
+#[cfg(windows)]
+pub const AF_BLUETOOTH: i32 = windows_sys::Win32::Devices::Bluetooth::AF_BTH as i32;
+#[cfg(windows)]
+pub const AF_BTH: i32 = AF_BLUETOOTH;
+#[cfg(windows)]
+pub const BTHPROTO_RFCOMM: i32 = windows_sys::Win32::Devices::Bluetooth::BTHPROTO_RFCOMM as i32;
+
+/// `hvsocket.h`: the only protocol an `AF_HYPERV` socket is opened with.
+#[cfg(windows)]
+pub const HV_PROTOCOL_RAW: i32 = 1;
+#[cfg(windows)]
+pub const HVSOCKET_CONNECT_TIMEOUT: i32 = 0x01;
+#[cfg(windows)]
+pub const HVSOCKET_CONNECT_TIMEOUT_MAX: i32 = 300_000;
+#[cfg(windows)]
+pub const HVSOCKET_CONNECTED_SUSPEND: i32 = 0x04;
+#[cfg(windows)]
+pub const HVSOCKET_ADDRESS_FLAG_PASSTHRU: i32 = 0x01;
+#[cfg(windows)]
+pub const HV_GUID_ZERO: &str = "00000000-0000-0000-0000-000000000000";
+#[cfg(windows)]
+pub const HV_GUID_WILDCARD: &str = "00000000-0000-0000-0000-000000000000";
+#[cfg(windows)]
+pub const HV_GUID_BROADCAST: &str = "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF";
+#[cfg(windows)]
+pub const HV_GUID_CHILDREN: &str = "90DB8B89-0D35-4F79-8CE9-49EA0AC8B7CD";
+#[cfg(windows)]
+pub const HV_GUID_LOOPBACK: &str = "E0E16197-DD56-4A10-9195-5EE7A155A838";
+#[cfg(windows)]
+pub const HV_GUID_PARENT: &str = "A42E7CDA-D03F-480C-9CC2-A4DE20ABB878";
+
+#[cfg(windows)]
+pub const SIO_TCP_SET_ACK_FREQUENCY: i32 =
+    windows_sys::Win32::Networking::WinSock::SIO_TCP_SET_ACK_FREQUENCY as i32;
+
+/// `SOCKADDR_HV` (`hvsocket.h`).
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SockaddrHv {
+    pub family: u16,
+    pub reserved: u16,
+    pub vm_id: windows_sys::core::GUID,
+    pub service_id: windows_sys::core::GUID,
+}
+
+#[cfg(windows)]
+pub fn sockaddr_hv(
+    vm_id: windows_sys::core::GUID,
+    service_id: windows_sys::core::GUID,
+) -> SockaddrHv {
+    SockaddrHv {
+        family: AF_HYPERV as u16,
+        reserved: 0,
+        vm_id,
+        service_id,
+    }
+}
+
+/// `SOCKADDR_BTH`.
+#[cfg(windows)]
+pub fn sockaddr_bth_rfcomm(
+    bd_addr: u64,
+    port: u32,
+) -> windows_sys::Win32::Devices::Bluetooth::SOCKADDR_BTH {
+    windows_sys::Win32::Devices::Bluetooth::SOCKADDR_BTH {
+        addressFamily: AF_BTH as u16,
+        btAddr: bd_addr,
+        serviceClassId: Default::default(),
+        port,
+    }
+}
+
+#[cfg(windows)]
+pub fn unpack_sockaddr_bth(ptr: *const u8) -> (u64, u32) {
+    let bth = unsafe { &*(ptr.cast::<windows_sys::Win32::Devices::Bluetooth::SOCKADDR_BTH>()) };
+    (bth.btAddr, bth.port)
+}
+
+/// `setbdaddr`: six hex octets separated by `:`.
+#[cfg(windows)]
+pub fn parse_bdaddr(name: &str) -> Option<u64> {
+    let mut parts = name.split(':');
+    let mut value = 0u64;
+    for _ in 0..6 {
+        let part = parts.next()?;
+        if part.is_empty() || part.len() > 2 {
+            return None;
+        }
+        let octet = u8::from_str_radix(part, 16).ok()?;
+        value = (value << 8) | u64::from(octet);
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(value)
+}
+
+/// `makebdaddr`: `XX:XX:XX:XX:XX:XX`, most significant octet first.
+#[cfg(windows)]
+pub fn format_bdaddr(bdaddr: u64) -> String {
+    let octet = |i: u32| (bdaddr >> (8 * i)) & 0xFF;
+    alloc::format!(
+        "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+        octet(5),
+        octet(4),
+        octet(3),
+        octet(2),
+        octet(1),
+        octet(0)
+    )
+}

@@ -1,0 +1,714 @@
+// spell-checker:disable
+
+pub(crate) use _signal::module_def;
+
+#[pymodule]
+pub(crate) mod _signal {
+    #![allow(unreachable_pub)]
+
+    use crate::{
+        Py, PyObjectRef, PyResult, VirtualMachine,
+        function::ArgIntoBool,
+        signal::{self, SignalNum},
+    };
+    use core::sync::atomic::{self, Ordering};
+
+    cfg_select! {
+        any(unix, windows, target_os = "wasi") => {
+            use crate::convert::IntoPyException;
+            use rustpython_host_env::signal as host_signal;
+        }
+        _ => {}
+    }
+
+    cfg_select! {
+        unix => {
+            use crate::{
+                builtins::{PyBaseExceptionRef, PyTypeRef},
+                stdlib::time::pytime::{self, Round},
+            };
+            use rustpython_host_env::signal::itimerval_to_tuple;
+
+            use std::os::fd::AsFd;
+        }
+        _ => {}
+    }
+
+    #[allow(non_camel_case_types)]
+    type sighandler_t = cfg_select! {
+        any(unix, windows) => libc::sighandler_t,
+        _ => usize,
+    };
+
+    cfg_select! {
+        windows => {
+            use crate::convert::TryFromBorrowedObject;
+
+            type WakeupFdRaw = libc::SOCKET;
+            struct WakeupFd(WakeupFdRaw);
+            const INVALID_WAKEUP: libc::SOCKET = host_signal::INVALID_SOCKET;
+            static WAKEUP: atomic::AtomicUsize = atomic::AtomicUsize::new(INVALID_WAKEUP);
+            // windows doesn't use the same fds for files and sockets like windows does, so we need
+            // this to know whether to send() or write()
+            static WAKEUP_IS_SOCKET: core::sync::atomic::AtomicBool =
+                core::sync::atomic::AtomicBool::new(false);
+
+            impl<'a> TryFromBorrowedObject<'a> for WakeupFd {
+                fn try_from_borrowed_object(
+                    vm: &VirtualMachine,
+                    obj: &'a crate::PyObject,
+                ) -> PyResult<Self> {
+                    // PyLong_AsSocket_t converts through a signed pointer-sized
+                    // integer, including __index__, before casting to SOCKET.
+                    isize::try_from_borrowed_object(vm, obj).map(|fd| Self(fd as _))
+                }
+            }
+        }
+        _ => {
+            type WakeupFdRaw = i32;
+            type WakeupFd = WakeupFdRaw;
+            const INVALID_WAKEUP: WakeupFd = -1;
+            static WAKEUP: atomic::AtomicI32 = atomic::AtomicI32::new(INVALID_WAKEUP);
+        }
+    }
+
+    static WARN_ON_FULL_BUFFER: atomic::AtomicBool = atomic::AtomicBool::new(true);
+
+    // Bounded pending-call storage: signal handlers cannot allocate or lock.
+    #[cfg(any(unix, windows))]
+    static WAKEUP_WRITE_ERRORS: [atomic::AtomicI32; 32] = [const { atomic::AtomicI32::new(0) }; 32];
+    #[cfg(windows)]
+    static WAKEUP_SEND_ERRORS: [atomic::AtomicI32; 32] = [const { atomic::AtomicI32::new(0) }; 32];
+
+    #[cfg(any(unix, windows, target_os = "wasi"))]
+    #[allow(unused_imports)]
+    pub use host_signal::SIG_ERR;
+
+    #[cfg(any(unix, windows, target_os = "wasi"))]
+    #[pyattr]
+    pub use host_signal::{SIG_DFL, SIG_IGN};
+
+    // pthread_sigmask 'how' constants
+    #[cfg(unix)]
+    #[pyattr]
+    use host_signal::{SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK};
+
+    #[cfg(not(any(unix, windows, target_os = "wasi")))]
+    #[pyattr]
+    pub const SIG_DFL: sighandler_t = 0;
+
+    #[cfg(not(any(unix, windows, target_os = "wasi")))]
+    #[pyattr]
+    pub const SIG_IGN: sighandler_t = 1;
+
+    #[cfg(not(any(unix, windows, target_os = "wasi")))]
+    #[allow(dead_code)]
+    pub const SIG_ERR: sighandler_t = -1 as _;
+
+    #[pyattr]
+    use crate::signal::NSIG;
+
+    #[cfg(any(unix, windows, target_os = "wasi"))]
+    #[pyattr]
+    pub use host_signal::{SIGABRT, SIGFPE, SIGILL, SIGINT, SIGSEGV, SIGTERM};
+
+    #[cfg(windows)]
+    #[pyattr]
+    const SIGBREAK: i32 = host_signal::SIGBREAK;
+
+    // Windows-specific control events for GenerateConsoleCtrlEvent
+    #[cfg(windows)]
+    #[pyattr]
+    const CTRL_C_EVENT: u32 = host_signal::CTRL_C_EVENT;
+
+    #[cfg(windows)]
+    #[pyattr]
+    const CTRL_BREAK_EVENT: u32 = host_signal::CTRL_BREAK_EVENT;
+
+    #[cfg(unix)]
+    #[pyattr]
+    use host_signal::{
+        SIGALRM, SIGBUS, SIGCHLD, SIGCONT, SIGHUP, SIGIO, SIGKILL, SIGPIPE, SIGPROF, SIGQUIT,
+        SIGSTOP, SIGSYS, SIGTRAP, SIGTSTP, SIGTTIN, SIGTTOU, SIGURG, SIGUSR1, SIGUSR2, SIGVTALRM,
+        SIGWINCH, SIGXCPU, SIGXFSZ,
+    };
+
+    #[cfg(unix)]
+    #[cfg(not(any(
+        target_vendor = "apple",
+        target_os = "openbsd",
+        target_os = "freebsd",
+        target_os = "netbsd"
+    )))]
+    #[pyattr]
+    use host_signal::{SIGPWR, SIGSTKFLT};
+
+    // Interval timer constants
+    #[cfg(unix)]
+    #[pyattr]
+    use host_signal::{ITIMER_PROF, ITIMER_REAL, ITIMER_VIRTUAL};
+
+    #[cfg(unix)]
+    #[pyattr(name = "ItimerError", once)]
+    fn itimer_error(vm: &VirtualMachine) -> PyTypeRef {
+        vm.ctx.new_exception_type(
+            "signal",
+            "ItimerError",
+            Some(vec![vm.ctx.exceptions.os_error.to_owned()]),
+        )
+    }
+
+    #[cfg(unix)]
+    fn new_itimer_error(err: std::io::Error, vm: &VirtualMachine) -> PyBaseExceptionRef {
+        let errno = err.raw_os_error();
+        let message = errno
+            .and_then(rustpython_host_env::errno::strerror_string)
+            .unwrap_or_else(|| err.to_string());
+        vm.new_os_subtype_error(itimer_error(vm), errno, message)
+            .upcast()
+    }
+
+    const _: () = assert!(SignalNum::VALID_RANGE.start.is_positive());
+    const _: () = assert!(SignalNum::VALID_RANGE.end.is_positive());
+
+    #[cfg(any(unix, windows, target_os = "wasi"))]
+    pub(super) fn init_signal_handlers(
+        module: &Py<crate::builtins::PyModule>,
+        vm: &VirtualMachine,
+    ) {
+        // Process-global signal disposition is owned by the main interpreter only.
+        // Subinterpreters (PEP 734) must not reinstall SIGINT / probe handlers.
+        if vm.state.is_main_interpreter() && vm.state.config.settings.install_signal_handlers {
+            let sig_dfl = vm.new_pyobj(SIG_DFL as u8);
+            let sig_ign = vm.new_pyobj(SIG_IGN as u8);
+
+            for signum in SignalNum::VALID_RANGE {
+                let Some(handler) = (unsafe { host_signal::probe_handler(signum) }) else {
+                    continue;
+                };
+                let (is_default, is_ignored) = cfg_select! {
+                    target_os = "wasi" => (
+                        handler == host_signal::Handler::Default,
+                        handler == host_signal::Handler::Ignore,
+                    ),
+                    _ => (handler == SIG_DFL, handler == SIG_IGN),
+                };
+                let py_handler = if is_default {
+                    Some(sig_dfl.clone())
+                } else if is_ignored {
+                    Some(sig_ign.clone())
+                } else {
+                    None
+                };
+
+                // SAFETY: Trust `SignalNum::VALID_RANGE`
+                let signum = unsafe { SignalNum::new_unchecked(signum) };
+
+                let signal_handlers = &vm.state.signal_handlers;
+                let _old_handler =
+                    core::mem::replace(&mut signal_handlers.lock()[signum], py_handler);
+                // Replacing a handler can run its destructor, which may install
+                // another handler. Release the table lock before dropping it.
+            }
+
+            let sigint_handler = vm.state.signal_handlers.lock()[SignalNum::SIGINT].clone();
+            let default_sigint = sigint_handler
+                .is_some_and(|handler| handler_disposition(&handler, vm) == Some(SIG_DFL));
+            if default_sigint {
+                let int_handler = module
+                    .get_attr("default_int_handler", vm)
+                    .expect("_signal does not have this attr?");
+
+                // An inherited ignored or foreign native handler is not ours
+                // to replace, even when installing Python's default handlers.
+                signal(SignalNum::SIGINT.into(), int_handler, vm)
+                    .expect("Failed to set sigint handler");
+            }
+        }
+    }
+
+    pub(crate) fn handler_disposition(
+        handler: &crate::PyObject,
+        vm: &VirtualMachine,
+    ) -> Option<sighandler_t> {
+        handler
+            .downcast_ref_if_exact::<crate::builtins::PyInt>(vm)
+            .and_then(|value| usize::try_from(value.as_bigint()).ok())
+            .filter(|&value| matches!(value, SIG_DFL | SIG_IGN))
+    }
+
+    #[cfg(not(any(unix, windows, target_os = "wasi")))]
+    #[pyfunction]
+    pub fn signal(
+        _signalnum: i32,
+        _handler: PyObjectRef,
+        vm: &VirtualMachine,
+    ) -> PyResult<Option<PyObjectRef>> {
+        Err(vm.new_not_implemented_error("signal is not implemented on this platform"))
+    }
+
+    #[cfg(any(unix, windows, target_os = "wasi"))]
+    #[pyfunction]
+    pub fn signal(
+        signalnum: i32,
+        handler: PyObjectRef,
+        vm: &VirtualMachine,
+    ) -> PyResult<Option<PyObjectRef>> {
+        #[cfg(windows)]
+        if !matches!(
+            signalnum,
+            SIGABRT | SIGBREAK | SIGFPE | SIGILL | SIGINT | SIGSEGV | SIGTERM
+        ) {
+            return Err(vm.new_value_error("invalid signal value"));
+        }
+
+        if !vm.is_main_thread() || !vm.state.is_main_interpreter() {
+            return Err(
+                vm.new_value_error("signal only works in main thread of the main interpreter")
+            );
+        }
+
+        let signalnum = SignalNum::try_from(signalnum).map_err(|msg| vm.new_value_error(msg))?;
+
+        let sig_handler = if handler.is_callable() {
+            let callback = run_signal as *const () as sighandler_t;
+            cfg_select! {
+                target_os = "wasi" => host_signal::Handler::Custom(callback),
+                _ => callback,
+            }
+        } else {
+            const MSG: &str =
+                "signal handler must be signal.SIG_IGN, signal.SIG_DFL, or a callable object";
+
+            let disposition =
+                handler_disposition(&handler, vm).ok_or_else(|| vm.new_type_error(MSG))?;
+            cfg_select! {
+                target_os = "wasi" => {
+                    if disposition == SIG_DFL {
+                        host_signal::Handler::Default
+                    } else {
+                        host_signal::Handler::Ignore
+                    }
+                },
+                _ => disposition,
+            }
+        };
+
+        signal::check_signals(vm)?;
+
+        unsafe { host_signal::install_handler(signalnum.into(), sig_handler) }
+            .map_err(|err| err.into_pyexception(vm))?;
+
+        let signal_handlers = &vm.state.signal_handlers;
+        let old_handler = signal_handlers.lock()[signalnum].replace(handler);
+        Ok(old_handler)
+    }
+
+    #[pyfunction]
+    fn getsignal(signalnum: SignalNum, vm: &VirtualMachine) -> PyObjectRef {
+        let signal_handlers = &vm.state.signal_handlers;
+        signal_handlers.lock()[signalnum]
+            .clone()
+            .unwrap_or_else(|| vm.ctx.none())
+    }
+
+    #[cfg(unix)]
+    #[pyfunction]
+    fn alarm(seconds: i32) -> u32 {
+        rustpython_host_env::signal::alarm(seconds as u32)
+    }
+
+    #[cfg(unix)]
+    #[pyfunction]
+    fn pause(vm: &VirtualMachine) -> PyResult<()> {
+        vm.allow_threads(host_signal::pause);
+        signal::check_signals(vm)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[derive(FromArgs)]
+    struct SetitimerArgs {
+        #[pyarg(positional)]
+        which: i32,
+        #[pyarg(positional)]
+        seconds: PyObjectRef,
+        #[pyarg(positional, optional, py_default = "0.0")]
+        interval: crate::function::OptionalArg<PyObjectRef>,
+    }
+
+    #[cfg(unix)]
+    #[pyfunction]
+    fn setitimer(args: SetitimerArgs, vm: &VirtualMachine) -> PyResult<(f64, f64)> {
+        let SetitimerArgs {
+            which,
+            seconds,
+            interval,
+        } = args;
+        let it_value = timer_timeval(&seconds, vm)?;
+        let it_interval = match interval {
+            crate::function::OptionalArg::Present(interval) => timer_timeval(&interval, vm)?,
+            crate::function::OptionalArg::Missing => libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+        };
+        let new = libc::itimerval {
+            it_value,
+            it_interval,
+        };
+        host_signal::setitimer(which, &new)
+            .map(|old| itimerval_to_tuple(&old))
+            .map_err(|err| new_itimer_error(err, vm))
+    }
+
+    #[cfg(unix)]
+    fn timer_timeval(object: &crate::PyObject, vm: &VirtualMachine) -> PyResult<libc::timeval> {
+        let nanoseconds = pytime::from_seconds_object(object, Round::Ceiling, vm)?;
+        let microseconds = Round::Ceiling.divide(nanoseconds, 1_000);
+        let seconds = microseconds.div_euclid(1_000_000);
+        #[allow(
+            clippy::useless_conversion,
+            reason = "time_t may be narrower on 32-bit targets"
+        )]
+        let tv_sec = seconds
+            .try_into()
+            .map_err(|_| vm.new_overflow_error("timestamp out of range for platform time_t"))?;
+        Ok(libc::timeval {
+            tv_sec,
+            tv_usec: microseconds.rem_euclid(1_000_000) as _,
+        })
+    }
+
+    #[cfg(unix)]
+    #[pyfunction]
+    fn getitimer(which: i32, vm: &VirtualMachine) -> PyResult<(f64, f64)> {
+        host_signal::getitimer(which)
+            .map(|old| itimerval_to_tuple(&old))
+            .map_err(|err| new_itimer_error(err, vm))
+    }
+
+    #[pyfunction]
+    fn default_int_handler(_signalnum: i32, _frame: PyObjectRef, vm: &VirtualMachine) -> PyResult {
+        Err(vm.new_exception_empty(vm.ctx.exceptions.keyboard_interrupt.to_owned()))
+    }
+
+    #[derive(FromArgs)]
+    struct SetWakeupFdArgs {
+        #[pyarg(positional)]
+        fd: PyObjectRef,
+        #[pyarg(named, default = ArgIntoBool::TRUE)]
+        warn_on_full_buffer: ArgIntoBool,
+    }
+
+    #[pyfunction]
+    fn set_wakeup_fd(args: SetWakeupFdArgs, vm: &VirtualMachine) -> PyResult<i64> {
+        // The keyword truth value is parsed before the fd conversion in CPython.
+        let fd = args.fd.try_to_value::<WakeupFd>(vm)?;
+        #[cfg(windows)]
+        let fd = fd.0;
+
+        if !vm.is_main_thread() || !vm.state.is_main_interpreter() {
+            return Err(vm.new_value_error(
+                "set_wakeup_fd only works in main thread of the main interpreter",
+            ));
+        }
+
+        #[cfg(windows)]
+        let is_socket = if fd != INVALID_WAKEUP {
+            host_signal::wakeup_fd_is_socket(fd).map_err(|err| {
+                if err.kind() == std::io::ErrorKind::InvalidInput {
+                    vm.new_value_error("invalid fd")
+                } else {
+                    err.into_pyexception(vm)
+                }
+            })?
+        } else {
+            false
+        };
+        #[cfg(unix)]
+        if let Ok(fd) = unsafe { rustpython_host_env::crt_fd::Borrowed::try_borrow_raw(fd) }
+            && rustpython_host_env::fcntl::get_blocking(fd.as_fd())
+                .map_err(|e| e.into_pyexception(vm))?
+        {
+            return Err(vm.new_value_error(format!(
+                "the fd {} must be in non-blocking mode",
+                fd.as_raw()
+            )));
+        }
+
+        let old_fd = WAKEUP.swap(fd, Ordering::Relaxed);
+        WARN_ON_FULL_BUFFER.store(args.warn_on_full_buffer.into_bool(), Ordering::Relaxed);
+
+        #[cfg(windows)]
+        WAKEUP_IS_SOCKET.store(is_socket, Ordering::Relaxed);
+
+        #[cfg(windows)]
+        if old_fd == INVALID_WAKEUP {
+            return Ok(-1);
+        }
+
+        Ok(old_fd as i64)
+    }
+
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[derive(FromArgs)]
+    struct PidfdSendSignalArgs {
+        #[pyarg(positional)]
+        pidfd: i32,
+        #[pyarg(positional)]
+        signalnum: core::ffi::c_int,
+        #[pyarg(positional, default = None)]
+        siginfo: Option<PyObjectRef>,
+        #[pyarg(positional, default)]
+        flags: core::ffi::c_int,
+    }
+
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[pyfunction]
+    fn pidfd_send_signal(
+        PidfdSendSignalArgs {
+            pidfd,
+            signalnum,
+            siginfo,
+            flags,
+        }: PidfdSendSignalArgs,
+        vm: &VirtualMachine,
+    ) -> PyResult<()> {
+        if siginfo.is_some() {
+            return Err(vm.new_type_error("siginfo must be None"));
+        }
+
+        host_signal::pidfd_send_signal(pidfd, signalnum, flags as u32)
+            .map_err(|_| vm.new_last_errno_error())
+    }
+
+    #[cfg(all(unix, not(target_os = "redox")))]
+    #[pyfunction]
+    fn siginterrupt(signalnum: SignalNum, flag: i32, vm: &VirtualMachine) -> PyResult<()> {
+        host_signal::siginterrupt(signalnum.into(), flag).map_err(|_| vm.new_last_errno_error())
+    }
+
+    #[cfg(any(unix, windows, target_os = "wasi"))]
+    #[pyfunction]
+    fn raise_signal(signalnum: i32, vm: &VirtualMachine) -> PyResult<()> {
+        let signalnum = SignalNum::try_from(signalnum).map_err(cfg_select! {
+            windows => |_| {
+                vm.new_errno_error(libc::EINVAL, "Invalid argument")
+                    .upcast()
+            },
+            _ => |msg| vm.new_value_error(msg),
+        })?;
+
+        vm.allow_threads(|| host_signal::raise_signal(signalnum.into()))
+            .map_err(|_| vm.new_os_error(format!("raise_signal failed for signal {signalnum}")))?;
+
+        // Check if a signal was triggered and handle it
+
+        signal::check_signals(vm)?;
+
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[pyfunction]
+    fn strsignal(signalnum: SignalNum) -> Option<String> {
+        host_signal::strsignal(signalnum.into())
+    }
+
+    #[pyfunction]
+    #[cfg_attr(
+        not(any(unix, windows)),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "WASI does not support signals yet"
+        )
+    )]
+    fn valid_signals(vm: &VirtualMachine) -> PyResult {
+        use crate::PyPayload;
+        use crate::builtins::PySet;
+        let set = PySet::default().into_ref(&vm.ctx);
+
+        // Empty set for platforms without signal support (e.g., WASM)
+        #[cfg(any(unix, windows))]
+        for signum in host_signal::valid_signals(signal::NSIG)
+            .map_err(|_| vm.new_os_error("sigfillset failed"))?
+        {
+            set.add(vm.ctx.new_int(signum).into(), vm)?;
+        }
+
+        Ok(set.into())
+    }
+
+    #[cfg(unix)]
+    fn sigset_to_pyset(mask: libc::sigset_t, vm: &VirtualMachine) -> PyResult {
+        use crate::PyPayload;
+        use crate::builtins::PySet;
+        let set = PySet::default().into_ref(&vm.ctx);
+        for signum in SignalNum::VALID_RANGE {
+            if host_signal::sigset_contains(mask, signum) {
+                set.add(vm.ctx.new_int(signum).into(), vm)?;
+            }
+        }
+        Ok(set.into())
+    }
+
+    #[cfg(unix)]
+    #[pyfunction]
+    fn pthread_sigmask(
+        how: i32,
+        mask: crate::function::ArgIterable,
+        vm: &VirtualMachine,
+    ) -> PyResult {
+        // Initialize sigset
+        let mut sigset = host_signal::sigemptyset().map_err(|e| e.into_pyexception(vm))?;
+
+        // Add signals to the set
+        for sig in mask.iter(vm)? {
+            let sig = sig?;
+            // Convert to i32
+            // - handling overflow by returning ValueError
+            // - validate signal number is in range [1, NSIG)
+            let signum = sig
+                .try_to_value::<i32>(vm)
+                .ok()
+                .filter(|v| SignalNum::VALID_RANGE.contains(v))
+                .ok_or_else(|| {
+                    vm.new_value_error(format!(
+                        "signal number out of range [1, {}]",
+                        SignalNum::VALID_RANGE.end - 1
+                    ))
+                })?;
+
+            host_signal::sigaddset(&mut sigset, signum).map_err(|e| e.into_pyexception(vm))?;
+        }
+
+        let old_mask =
+            host_signal::pthread_sigmask(how, &sigset).map_err(|e| e.into_pyexception(vm))?;
+
+        // Check for pending signals
+        signal::check_signals(vm)?;
+
+        // Convert old mask to Python set
+        sigset_to_pyset(old_mask, vm)
+    }
+
+    #[cfg(any(unix, windows, target_os = "wasi"))]
+    pub extern "C" fn run_signal(signum: i32) {
+        // Asynchronously executing signal handlers should not mutate errno
+        // under the feet of the interrupted code.
+        let save_errno = rustpython_host_env::os::get_errno();
+        trip_signal(signum);
+        rustpython_host_env::os::set_errno(save_errno);
+    }
+
+    #[cfg(any(unix, windows, target_os = "wasi"))]
+    fn trip_signal(signum: i32) {
+        signal::TRIGGERS[signum as usize].store(true, Ordering::Relaxed);
+        signal::set_triggered();
+
+        #[cfg(target_os = "wasi")]
+        host_signal::notify_signal(signum, WAKEUP.load(Ordering::Relaxed));
+
+        #[cfg(any(unix, windows))]
+        {
+            let error = host_signal::notify_signal(
+                signum,
+                WAKEUP.load(Ordering::Relaxed),
+                #[cfg(windows)]
+                WAKEUP_IS_SOCKET.load(Ordering::Relaxed),
+                #[cfg(windows)]
+                signal::get_sigint_event(),
+            );
+            if let Some(error) = error
+                && (WARN_ON_FULL_BUFFER.load(Ordering::Relaxed) || !error.is_would_block())
+            {
+                let (errors, errno) = match error {
+                    host_signal::WakeupError::Write(errno) => (&WAKEUP_WRITE_ERRORS, errno),
+                    #[cfg(windows)]
+                    host_signal::WakeupError::Send(errno) => (&WAKEUP_SEND_ERRORS, errno),
+                };
+                for pending in errors {
+                    if pending
+                        .compare_exchange(0, errno, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        // The VM may have handled the signal on another thread
+                        // before the failed wakeup write completed.
+                        signal::set_triggered();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    pub(crate) fn wakeup_errors_pending() -> bool {
+        let pending = WAKEUP_WRITE_ERRORS
+            .iter()
+            .any(|error| error.load(Ordering::Relaxed) != 0);
+        #[cfg(windows)]
+        let pending = pending
+            || WAKEUP_SEND_ERRORS
+                .iter()
+                .any(|error| error.load(Ordering::Relaxed) != 0);
+        pending
+    }
+
+    #[cfg(any(unix, windows))]
+    pub(crate) fn report_wakeup_errors(vm: &VirtualMachine) {
+        fn report(
+            errors: &[atomic::AtomicI32],
+            make_error: fn(i32) -> host_signal::WakeupError,
+            operation: &str,
+            vm: &VirtualMachine,
+        ) {
+            for pending in errors {
+                let errno = pending.swap(0, Ordering::Relaxed);
+                if errno != 0 {
+                    vm.run_unraisable(
+                        make_error(errno).into_io_error().into_pyexception(vm),
+                        Some(format!(
+                            "Exception ignored while trying to {operation} to the signal wakeup fd"
+                        )),
+                        vm.ctx.none(),
+                    );
+                }
+            }
+        }
+        report(
+            &WAKEUP_WRITE_ERRORS,
+            host_signal::WakeupError::Write,
+            "write",
+            vm,
+        );
+        #[cfg(windows)]
+        report(
+            &WAKEUP_SEND_ERRORS,
+            host_signal::WakeupError::Send,
+            "send",
+            vm,
+        );
+    }
+
+    /// Reset wakeup fd after fork in child process.
+    /// The child must not write to the parent's wakeup fd.
+    #[cfg(unix)]
+    pub(crate) fn clear_wakeup_fd_after_fork() {
+        WAKEUP.store(INVALID_WAKEUP, Ordering::Relaxed);
+    }
+
+    #[expect(clippy::unnecessary_wraps, reason = "Needs to comply with a signature")]
+    pub(crate) fn module_exec(
+        vm: &VirtualMachine,
+        module: &Py<crate::builtins::PyModule>,
+    ) -> PyResult<()> {
+        __module_exec(vm, module);
+
+        #[cfg(any(unix, windows, target_os = "wasi"))]
+        init_signal_handlers(module, vm);
+
+        Ok(())
+    }
+}

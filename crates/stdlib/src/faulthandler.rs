@@ -1,0 +1,1159 @@
+pub(crate) use decl::module_def;
+
+#[allow(static_mut_refs)] // TODO: group code only with static mut refs
+#[pymodule(name = "faulthandler")]
+mod decl {
+    use crate::vm::{
+        AsObject, PyObjectRef, PyResult, VirtualMachine,
+        builtins::PyInt,
+        function::{ArgIntoBool, OptionalArg},
+        stdlib::time::pytime,
+    };
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+    use core::time::Duration;
+    use num_traits::ToPrimitive;
+    use parking_lot::{Condvar, Mutex};
+    #[cfg(any(unix, windows))]
+    use rustpython_host_env::faulthandler as host_faulthandler;
+    #[cfg(any(unix, windows))]
+    use rustpython_host_env::os::{get_errno, set_errno};
+    use std::thread;
+
+    /// fatal_error state
+    struct FatalErrorState {
+        enabled: AtomicBool,
+        fd: AtomicI32,
+        all_threads: AtomicBool,
+    }
+
+    static FATAL_ERROR: FatalErrorState = FatalErrorState {
+        enabled: AtomicBool::new(false),
+        fd: AtomicI32::new(2), // stderr by default
+        all_threads: AtomicBool::new(true),
+    };
+
+    #[cfg(feature = "threading")]
+    type ThreadFrameSlot = Arc<rustpython_vm::vm::thread::ThreadSlot>;
+
+    // Watchdog thread state for dump_traceback_later
+    struct WatchdogState {
+        cancel: bool,
+        fd: i32,
+        timeout_us: u64,
+        max_threads: isize,
+        repeat: bool,
+        exit: bool,
+        header: String,
+        #[cfg(feature = "threading")]
+        thread_frame_slots: Vec<(u64, ThreadFrameSlot)>,
+    }
+
+    type WatchdogHandle = Arc<(Mutex<WatchdogState>, Condvar)>;
+    static WATCHDOG: Mutex<Option<WatchdogHandle>> = Mutex::new(None);
+
+    // Signal-safe output functions
+
+    // PUTS macro
+    #[cfg(any(unix, windows))]
+    fn puts(fd: i32, s: &str) {
+        puts_bytes(fd, s.as_bytes())
+    }
+
+    #[cfg(any(unix, windows))]
+    fn puts_bytes(fd: i32, s: &[u8]) {
+        host_faulthandler::write_fd(fd, s);
+    }
+
+    // _Py_DumpHexadecimal (traceback.c)
+    #[cfg(any(unix, windows))]
+    fn dump_hexadecimal(fd: i32, value: u64, width: usize) {
+        puts(fd, "0x");
+        dump_hex_digits(fd, value, width);
+    }
+
+    #[cfg(any(unix, windows))]
+    fn dump_hex_digits(fd: i32, value: u64, width: usize) {
+        const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+        let mut buf = [0u8; 16];
+        for (i, byte) in buf.iter_mut().take(width).enumerate() {
+            let digit = ((value >> (4 * (width - 1 - i))) & 0xf) as usize;
+            *byte = HEX_CHARS[digit];
+        }
+        puts_bytes(fd, &buf[..width]);
+    }
+
+    // _Py_DumpDecimal (traceback.c)
+    #[cfg(any(unix, windows))]
+    fn dump_decimal(fd: i32, value: usize) {
+        let mut buf = [0u8; 20];
+        let mut v = value;
+        let mut i = buf.len();
+
+        if v == 0 {
+            puts(fd, "0");
+            return;
+        }
+
+        while v > 0 {
+            i -= 1;
+            buf[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+        }
+
+        puts_bytes(fd, &buf[i..]);
+    }
+
+    /// Get current thread ID
+    #[cfg(any(unix, windows))]
+    fn current_thread_id() -> u64 {
+        host_faulthandler::current_thread_id()
+    }
+
+    // write_thread_id (traceback.c:1240-1256)
+    #[cfg(any(unix, windows))]
+    fn write_thread_id(fd: i32, thread_id: u64, is_current: bool) {
+        if is_current {
+            puts(fd, "Current thread ");
+        } else {
+            puts(fd, "Thread ");
+        }
+        dump_hexadecimal(fd, thread_id, core::mem::size_of::<usize>() * 2);
+        puts(fd, " (most recent call first):\n");
+    }
+
+    /// Dump the current thread's live frame chain to fd (signal-safe).
+    /// Walks the InterpreterFrame chain directly.
+    #[cfg(any(unix, windows))]
+    fn dump_live_frames(fd: i32) {
+        const MAX_FRAME_DEPTH: usize = 100;
+
+        let mut cur = crate::vm::vm::thread::get_current_frame();
+        if cur.is_null() {
+            puts(fd, "  <no Python frame>\n");
+            return;
+        }
+        let mut depth = 0;
+        while !cur.is_null() && depth < MAX_FRAME_DEPTH {
+            let iframe = unsafe { &*cur };
+            dump_iframe(fd, iframe);
+            depth += 1;
+            cur = iframe.previous();
+        }
+        if depth == 0 {
+            puts(fd, "  <no Python frame>\n");
+        } else if depth >= MAX_FRAME_DEPTH && !cur.is_null() {
+            puts(fd, "  ...\n");
+        }
+    }
+
+    /// Dump a single InterpreterFrame's info to fd (signal-safe).
+    #[cfg(any(unix, windows))]
+    fn dump_iframe(fd: i32, iframe: &rustpython_vm::frame::InterpreterFrame) {
+        let code = iframe.code();
+        let filename = code.source_path().as_wtf8();
+        let funcname = code.obj_name.as_wtf8();
+        let lasti = iframe.get_lasti();
+        let lineno = if lasti == 0 {
+            code.first_line_number.map_or(1, |n| n.get()) as u32
+        } else {
+            let idx = (lasti as usize).saturating_sub(1);
+            if idx < code.locations.len() {
+                code.locations[idx].0.line.get() as u32
+            } else {
+                code.first_line_number.map_or(0, |n| n.get()) as u32
+            }
+        };
+
+        puts(fd, "  File \"");
+        dump_ascii(fd, filename);
+        puts(fd, "\", line ");
+        dump_decimal(fd, lineno as usize);
+        puts(fd, " in ");
+        dump_ascii(fd, funcname);
+        puts(fd, "\n");
+    }
+
+    // faulthandler_dump_traceback (signal-safe, for fatal errors)
+    #[cfg(any(unix, windows))]
+    fn faulthandler_dump_traceback(fd: i32, all_threads: bool) {
+        static REENTRANT: AtomicBool = AtomicBool::new(false);
+
+        if REENTRANT.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        // Write thread header
+        if all_threads {
+            write_thread_id(fd, current_thread_id(), true);
+        } else {
+            puts(fd, "Stack (most recent call first):\n");
+        }
+
+        dump_live_frames(fd);
+
+        REENTRANT.store(false, Ordering::SeqCst);
+    }
+
+    /// MAX_STRING_LENGTH in traceback.c
+    #[cfg(any(unix, windows))]
+    const MAX_STRING_LENGTH: usize = 500;
+
+    /// `_Py_DumpASCII`: escape non-printable code points and truncate by
+    /// character count, without allocation or Python calls in a signal handler.
+    #[cfg(any(unix, windows))]
+    fn dump_ascii(fd: i32, s: &rustpython_common::wtf8::Wtf8) {
+        let prefix = &s.as_bytes()[..s.len().min(MAX_STRING_LENGTH)];
+        if prefix.iter().all(|byte| (0x20..=0x7e).contains(byte)) {
+            puts_bytes(fd, prefix);
+            if s.len() > MAX_STRING_LENGTH {
+                puts(fd, "...");
+            }
+            return;
+        }
+        let mut points = s.code_points();
+        for point in points.by_ref().take(MAX_STRING_LENGTH) {
+            let value = point.to_u32();
+            if (0x20..=0x7e).contains(&value) {
+                puts_bytes(fd, &[value as u8]);
+            } else {
+                let (prefix, width) = if value <= 0xff {
+                    ("\\x", 2)
+                } else if value <= 0xffff {
+                    ("\\u", 4)
+                } else {
+                    ("\\U", 8)
+                };
+                puts(fd, prefix);
+                dump_hex_digits(fd, u64::from(value), width);
+            }
+        }
+        if points.next().is_some() {
+            puts(fd, "...");
+        }
+    }
+
+    #[derive(FromArgs)]
+    struct DumpTracebackArgs {
+        #[pyarg(any, default, py_default = "sys.stderr")]
+        file: OptionalArg<PyObjectRef>,
+        #[pyarg(any, default = ArgIntoBool::TRUE)]
+        all_threads: ArgIntoBool,
+        #[pyarg(named, default = 100)]
+        max_threads: isize,
+    }
+
+    #[pyfunction]
+    fn dump_traceback(args: DumpTracebackArgs, vm: &VirtualMachine) -> PyResult<()> {
+        let (fd, _file) = get_fd_from_file_opt(args.file, vm)?;
+
+        #[cfg(any(unix, windows))]
+        {
+            if args.all_threads.into_bool() {
+                dump_all_threads(fd, args.max_threads, vm);
+            } else {
+                puts(fd, "Stack (most recent call first):\n");
+                dump_live_frames(fd);
+            }
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (fd, args.all_threads, args.max_threads);
+        }
+
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[derive(FromArgs)]
+    struct DumpCStackArgs {
+        #[pyarg(any, default, py_default = "sys.stderr")]
+        file: OptionalArg<PyObjectRef>,
+    }
+
+    /// Dump the C stack of the current thread.
+    #[cfg(any(unix, windows))]
+    #[pyfunction]
+    fn dump_c_stack(args: DumpCStackArgs, vm: &VirtualMachine) -> PyResult<()> {
+        let (fd, file) = get_fd_from_file_opt(args.file, vm)?;
+        // Native unwinding and loader lookup run in ordinary execution only,
+        // never in one of this module's asynchronous signal callbacks.
+        host_faulthandler::dump_c_stack(fd);
+        drop(file);
+        vm.check_signals()
+    }
+
+    /// Dump tracebacks of all threads.
+    #[cfg(any(unix, windows))]
+    fn dump_all_threads(fd: i32, max_threads: isize, vm: &VirtualMachine) {
+        let max_threads = if max_threads == 0 { 100 } else { max_threads };
+        let mut nthreads = 0;
+        let mut begin_thread_dump = || {
+            if nthreads != 0 {
+                puts(fd, "\n");
+            }
+            if nthreads >= max_threads {
+                puts(fd, "...\n");
+                return false;
+            }
+            nthreads += 1;
+            true
+        };
+        // Get all threads' frame stacks from the shared registry
+        // Stop the world so every other thread is parked at a safepoint
+        // and its frame chain is quiescent and alive while we walk it (matches
+        // faulthandler.dump_traceback running with the GIL held).
+        #[cfg(feature = "threading")]
+        {
+            use core::sync::atomic::Ordering;
+            let current_tid = rustpython_vm::stdlib::_thread::get_ident();
+            {
+                vm.state.stop_the_world.stop_the_world(&vm.state);
+                scopeguard::defer! { vm.state.stop_the_world.start_the_world(&vm.state); }
+                let registry = vm.state.thread_frames.lock();
+                #[expect(
+                    clippy::iter_over_hash_type,
+                    reason = "Iteration order doesn't matter here"
+                )]
+                for (&tid, slot) in registry.iter() {
+                    if tid == current_tid {
+                        continue;
+                    }
+                    if !begin_thread_dump() {
+                        return;
+                    }
+                    // Under STW, all other threads are suspended so their
+                    // stack-allocated iframes are stable. Walk via top_iframe
+                    // which covers both FrameObject and stack-allocated paths.
+                    let iframe_ptr = slot.top_iframe.load(Ordering::Relaxed)
+                        as *const rustpython_vm::frame::InterpreterFrame;
+                    write_thread_id(fd, tid, false);
+                    if iframe_ptr.is_null() {
+                        puts(fd, "  <no Python frame>\n");
+                    } else {
+                        let mut cur = iframe_ptr;
+                        let mut depth = 0;
+                        while !cur.is_null() && depth < 100 {
+                            let iframe = unsafe { &*cur };
+                            dump_iframe(fd, iframe);
+                            depth += 1;
+                            cur = iframe.previous();
+                        }
+                        if depth >= 100 && !cur.is_null() {
+                            puts(fd, "  ...\n");
+                        }
+                    }
+                }
+            }
+
+            // Now dump current thread from its live frame chain
+            // (includes stack-allocated iframes without FrameObject).
+            if !begin_thread_dump() {
+                return;
+            }
+            write_thread_id(fd, current_tid, true);
+            dump_live_frames(fd);
+        }
+
+        #[cfg(not(feature = "threading"))]
+        {
+            let _ = vm;
+            if !begin_thread_dump() {
+                return;
+            }
+            write_thread_id(fd, current_thread_id(), true);
+            dump_live_frames(fd);
+        }
+    }
+
+    #[derive(FromArgs)]
+    #[allow(unused)]
+    struct EnableArgs {
+        #[pyarg(any, default, py_default = "sys.stderr")]
+        file: OptionalArg<PyObjectRef>,
+        #[pyarg(any, default = ArgIntoBool::TRUE)]
+        all_threads: ArgIntoBool,
+    }
+
+    // faulthandler_py_enable
+    #[pyfunction]
+    fn enable(args: EnableArgs, vm: &VirtualMachine) -> PyResult<()> {
+        // Get file descriptor
+        let (fd, _file) = get_fd_from_file_opt(args.file, vm)?;
+
+        // Store fd and all_threads in global state
+        FATAL_ERROR.fd.store(fd, Ordering::Relaxed);
+        FATAL_ERROR
+            .all_threads
+            .store(args.all_threads.into_bool(), Ordering::Relaxed);
+
+        // Install signal handlers
+        if !faulthandler_enable_internal() {
+            return Err(vm.new_runtime_error("Failed to enable faulthandler"));
+        }
+
+        Ok(())
+    }
+
+    // Signal handlers
+
+    // faulthandler_fatal_error
+    #[cfg(unix)]
+    extern "C" fn faulthandler_fatal_error(signum: core::ffi::c_int) {
+        let save_errno = get_errno();
+
+        if !FATAL_ERROR.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let fd = FATAL_ERROR.fd.load(Ordering::Relaxed);
+
+        if let Some(name) = host_faulthandler::fatal_signal_name(signum) {
+            host_faulthandler::disable_fatal_signal(signum);
+            puts(fd, "Fatal Python error: ");
+            puts(fd, name);
+            puts(fd, "\n\n");
+        } else {
+            puts(fd, "Fatal Python error from unexpected signum: ");
+            dump_decimal(fd, signum as usize);
+            puts(fd, "\n\n");
+        }
+
+        let all_threads = FATAL_ERROR.all_threads.load(Ordering::Relaxed);
+        faulthandler_dump_traceback(fd, all_threads);
+
+        set_errno(save_errno);
+
+        // Reset to default handler and re-raise to ensure process terminates.
+        // We cannot just restore the previous handler because Rust's runtime
+        // may have installed its own SIGSEGV handler (for stack overflow detection)
+        // that doesn't terminate the process on software-raised signals.
+        host_faulthandler::signal_default_and_raise(signum);
+
+        // Fallback if raise() somehow didn't terminate the process
+        host_faulthandler::exit_immediately(1);
+    }
+
+    // faulthandler_fatal_error for Windows
+    #[cfg(windows)]
+    extern "C" fn faulthandler_fatal_error(signum: core::ffi::c_int) {
+        let save_errno = get_errno();
+
+        if !FATAL_ERROR.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let fd = FATAL_ERROR.fd.load(Ordering::Relaxed);
+
+        if let Some(name) = host_faulthandler::fatal_signal_name(signum) {
+            host_faulthandler::disable_fatal_signal(signum);
+            puts(fd, "Fatal Python error: ");
+            puts(fd, name);
+            puts(fd, "\n\n");
+        } else {
+            puts(fd, "Fatal Python error from unexpected signum: ");
+            dump_decimal(fd, signum as usize);
+            puts(fd, "\n\n");
+        }
+
+        let all_threads = FATAL_ERROR.all_threads.load(Ordering::Relaxed);
+        faulthandler_dump_traceback(fd, all_threads);
+
+        set_errno(save_errno);
+
+        host_faulthandler::signal_default_and_raise(signum);
+
+        // Fallback
+        rustpython_host_env::os::exit_immediately(1);
+    }
+
+    // Windows vectored exception handler (faulthandler.c:417-480)
+    #[cfg(windows)]
+    static EXC_HANDLER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+    #[cfg(windows)]
+    fn faulthandler_ignore_exception(code: u32) -> bool {
+        host_faulthandler::ignore_exception(code)
+    }
+
+    #[cfg(windows)]
+    unsafe extern "system" fn faulthandler_exc_handler(
+        exc_info: *mut host_faulthandler::ExceptionPointers,
+    ) -> i32 {
+        if !FATAL_ERROR.enabled.load(Ordering::Relaxed) {
+            return host_faulthandler::EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        let code = unsafe { host_faulthandler::exception_code(exc_info) };
+
+        if faulthandler_ignore_exception(code) {
+            return host_faulthandler::EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        let fd = FATAL_ERROR.fd.load(Ordering::Relaxed);
+
+        puts(fd, "Windows fatal exception: ");
+        if let Some(description) = host_faulthandler::exception_description(code) {
+            puts(fd, description);
+        } else {
+            puts(fd, "code ");
+            dump_hexadecimal(fd, code as u64, 8);
+        }
+        puts(fd, "\n\n");
+
+        // Disable SIGSEGV handler for access violations to avoid double output
+        if host_faulthandler::is_access_violation(code) {
+            host_faulthandler::disable_fatal_signal(host_faulthandler::SIGSEGV);
+        }
+
+        let all_threads = FATAL_ERROR.all_threads.load(Ordering::Relaxed);
+        faulthandler_dump_traceback(fd, all_threads);
+
+        host_faulthandler::EXCEPTION_CONTINUE_SEARCH
+    }
+
+    // faulthandler_enable
+    #[cfg(unix)]
+    fn faulthandler_enable_internal() -> bool {
+        if FATAL_ERROR.enabled.load(Ordering::Relaxed) {
+            return true;
+        }
+
+        if !host_faulthandler::enable_fatal_handlers(
+            faulthandler_fatal_error,
+            host_faulthandler::SA_NODEFER,
+        ) {
+            return false;
+        }
+
+        FATAL_ERROR.enabled.store(true, Ordering::Relaxed);
+        true
+    }
+
+    #[cfg(windows)]
+    fn faulthandler_enable_internal() -> bool {
+        if FATAL_ERROR.enabled.load(Ordering::Relaxed) {
+            return true;
+        }
+
+        if !host_faulthandler::enable_fatal_handlers(faulthandler_fatal_error, 0) {
+            return false;
+        }
+
+        // Register Windows vectored exception handler
+        #[cfg(windows)]
+        {
+            let h =
+                host_faulthandler::add_vectored_exception_handler(Some(faulthandler_exc_handler));
+            EXC_HANDLER.store(h as usize, Ordering::Relaxed);
+        }
+
+        FATAL_ERROR.enabled.store(true, Ordering::Relaxed);
+        true
+    }
+
+    // faulthandler_disable
+    #[cfg(any(unix, windows))]
+    fn faulthandler_disable_internal() {
+        if !FATAL_ERROR.enabled.swap(false, Ordering::Relaxed) {
+            return;
+        }
+
+        host_faulthandler::disable_fatal_handlers();
+
+        // Remove Windows vectored exception handler
+        #[cfg(windows)]
+        {
+            let h = EXC_HANDLER.swap(0, Ordering::Relaxed);
+            host_faulthandler::remove_vectored_exception_handler(h);
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn faulthandler_enable_internal() -> bool {
+        FATAL_ERROR.enabled.store(true, Ordering::Relaxed);
+        true
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn faulthandler_disable_internal() {
+        FATAL_ERROR.enabled.store(false, Ordering::Relaxed);
+    }
+
+    // faulthandler_disable_py
+    #[pyfunction]
+    fn disable() -> bool {
+        let was_enabled = FATAL_ERROR.enabled.load(Ordering::Relaxed);
+        faulthandler_disable_internal();
+        was_enabled
+    }
+
+    // faulthandler_is_enabled
+    #[pyfunction]
+    fn is_enabled() -> bool {
+        FATAL_ERROR.enabled.load(Ordering::Relaxed)
+    }
+
+    fn format_timeout(timeout_us: u64) -> String {
+        let sec = timeout_us / 1_000_000;
+        let us = timeout_us % 1_000_000;
+        let min = sec / 60;
+        let sec = sec % 60;
+        let hour = min / 60;
+        let min = min % 60;
+
+        // Match Python's timedelta str format: H:MM:SS.ffffff (no leading zero for hours)
+        if us != 0 {
+            format!("Timeout ({hour}:{min:02}:{sec:02}.{us:06})!\n")
+        } else {
+            format!("Timeout ({hour}:{min:02}:{sec:02})!\n")
+        }
+    }
+
+    fn get_fd_from_file_opt(
+        file: OptionalArg<PyObjectRef>,
+        vm: &VirtualMachine,
+    ) -> PyResult<(i32, PyObjectRef)> {
+        let file = match file {
+            OptionalArg::Present(file) if !vm.is_none(&file) => {
+                // Check if it's an integer (file descriptor)
+                if let Some(int) = file.downcast_ref::<PyInt>() {
+                    if file.class().is(vm.ctx.types.bool_type) {
+                        rustpython_vm::stdlib::_warnings::warn(
+                            vm.ctx.exceptions.runtime_warning,
+                            "bool is used as a file descriptor".to_owned(),
+                            1,
+                            vm,
+                        )?;
+                    }
+                    let fd = int.try_to_primitive(vm).map_err(|_| {
+                        vm.new_overflow_error("Python int too large to convert to C int")
+                    })?;
+                    if fd < 0 {
+                        return Err(vm.new_value_error("file is not a valid file descriptor"));
+                    }
+                    return Ok((fd, file));
+                }
+                file
+            }
+            _ => {
+                // file=None or file not passed: fall back to sys.stderr
+                let stderr = vm.sys_module.get_attr("stderr", vm)?;
+                if vm.is_none(&stderr) {
+                    return Err(vm.new_runtime_error("sys.stderr is None"));
+                }
+                stderr
+            }
+        };
+
+        // fileno() must return an actual int, not an object with __index__.
+        // Unlike an integer passed directly, its upper bound excludes INT_MAX.
+        // Try to get fileno() from file object
+        let fileno = vm.call_method(&file, "fileno", ())?;
+        let fd = fileno
+            .downcast_ref::<PyInt>()
+            .and_then(|value| value.as_bigint().to_i32())
+            .filter(|&fd| (0..i32::MAX).contains(&fd));
+        drop(fileno);
+        let fd =
+            fd.ok_or_else(|| vm.new_runtime_error("file.fileno() is not a valid file descriptor"))?;
+        // Try to flush the file
+        let _ = vm.call_method(&file, "flush", ());
+        // Keep the selected file alive until the caller has used its descriptor.
+        Ok((fd, file))
+    }
+
+    fn watchdog_thread(state: WatchdogHandle) {
+        let (lock, cvar) = &*state;
+
+        loop {
+            // Hold lock across wait_timeout to avoid race condition
+            let mut guard = lock.lock();
+            if guard.cancel {
+                return;
+            }
+            let timeout = Duration::from_micros(guard.timeout_us);
+            // A notification or spurious wake does not mean the deadline passed.
+            cvar.wait_while_for(&mut guard, |state| !state.cancel, timeout);
+
+            // Check if cancelled after wait
+            if guard.cancel {
+                return;
+            }
+
+            // Extract values before releasing lock for I/O
+            let repeat = guard.repeat;
+            let exit = guard.exit;
+            let fd = guard.fd;
+            let max_threads = guard.max_threads;
+            let header = guard.header.clone();
+            #[cfg(feature = "threading")]
+            let thread_frame_slots = guard.thread_frame_slots.clone();
+            drop(guard); // Release lock before I/O
+
+            // Timeout occurred, dump traceback
+            cfg_select! {
+                target_arch = "wasm32" => {
+                    let _ = (exit, fd, max_threads, &header);
+                }
+                _ => {
+                    puts_bytes(fd, header.as_bytes());
+                    let mut nthreads = 0;
+                    let mut begin_thread_dump = || {
+                        if nthreads != 0 {
+                            puts(fd, "\n");
+                        }
+                        if nthreads >= max_threads {
+                            puts(fd, "...\n");
+                            return false;
+                        }
+                        nthreads += 1;
+                        true
+                    };
+
+                    // Use thread frame slots when threading is enabled (includes all threads).
+                    // Fall back to live frame walking for non-threaded builds.
+                    cfg_select! {
+                        all(unix, feature = "threading") => {
+                            // The watchdog is a plain OS thread, not attached to
+                            // the VM, so it cannot stop-the-world. Walk each
+                            // published top frame lock-free and best-effort, like
+                            // the faulthandler watchdog thread.
+                            // Walk via top_iframe for all threads. The watchdog
+                            // cannot stop-the-world, so this is best-effort
+                            // (like CPython's _Py_DumpTracebackThreads). Stack
+                            // frames are still alive because the target thread
+                            // is executing (inside a blocking call).
+                            for (tid, slot) in &thread_frame_slots {
+                                if !begin_thread_dump() {
+                                    break;
+                                }
+                                let iframe_ptr =
+                                    slot.top_iframe.load(core::sync::atomic::Ordering::Relaxed)
+                                        as *const rustpython_vm::frame::InterpreterFrame;
+                                write_thread_id(fd, *tid, false);
+                                if iframe_ptr.is_null() {
+                                    puts(fd, "  <no Python frame>\n");
+                                } else {
+                                    let mut cur = iframe_ptr;
+                                    let mut depth = 0;
+                                    while !cur.is_null() && depth < 100 {
+                                        let iframe = unsafe { &*cur };
+                                        dump_iframe(fd, iframe);
+                                        depth += 1;
+                                        cur = iframe.previous();
+                                    }
+                                    if depth >= 100 && !cur.is_null() {
+                                        puts(fd, "  ...\n");
+                                    }
+                                }
+                            }
+                        }
+                        all(not(unix), feature = "threading") => {
+                            for (tid, slot) in &thread_frame_slots {
+                                if !begin_thread_dump() {
+                                    break;
+                                }
+                                let iframe_ptr =
+                                    slot.top_iframe.load(core::sync::atomic::Ordering::Relaxed)
+                                        as *const rustpython_vm::frame::InterpreterFrame;
+                                write_thread_id(fd, *tid, false);
+                                if iframe_ptr.is_null() {
+                                    puts(fd, "  <no Python frame>\n");
+                                } else {
+                                    let mut cur = iframe_ptr;
+                                    let mut depth = 0;
+                                    while !cur.is_null() && depth < 100 {
+                                        let iframe = unsafe { &*cur };
+                                        dump_iframe(fd, iframe);
+                                        depth += 1;
+                                        cur = iframe.previous();
+                                    }
+                                    if depth >= 100 && !cur.is_null() {
+                                        puts(fd, "  ...\n");
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            if begin_thread_dump() {
+                                write_thread_id(fd, current_thread_id(), false);
+                                dump_live_frames(fd);
+                            }
+                        }
+                    }
+
+                    if exit {
+                        rustpython_host_env::os::exit_immediately(1);
+                    }
+                }
+            }
+
+            if !repeat {
+                return;
+            }
+        }
+    }
+
+    #[derive(FromArgs)]
+    #[allow(unused)]
+    struct DumpTracebackLaterArgs {
+        // Clinic converts repeat/exit before interpreting the timeout object.
+        #[pyarg(any)]
+        timeout: PyObjectRef,
+        #[pyarg(any, default = ArgIntoBool::FALSE)]
+        repeat: ArgIntoBool,
+        #[pyarg(any, default, py_default = "sys.stderr")]
+        file: OptionalArg<PyObjectRef>,
+        #[pyarg(any, default = ArgIntoBool::FALSE)]
+        exit: ArgIntoBool,
+        #[pyarg(named, default = 100)]
+        max_threads: isize,
+    }
+
+    #[pyfunction]
+    fn dump_traceback_later(args: DumpTracebackLaterArgs, vm: &VirtualMachine) -> PyResult<()> {
+        let timeout = pytime::from_seconds_object(&args.timeout, pytime::Round::Up, vm)?;
+        let timeout_us = pytime::Round::Up.divide(timeout, 1_000);
+        if timeout_us <= 0 {
+            return Err(vm.new_value_error("timeout must be greater than 0"));
+        }
+        pytime::check_thread_timeout(timeout, vm)?;
+        // CPython also bounds the seconds passed to format_timeout by LONG_MAX.
+        #[allow(clippy::unnecessary_cast)] // c_long is i32 or i64.
+        let max_seconds = core::ffi::c_long::MAX as i64;
+        if timeout_us / 1_000_000 > max_seconds {
+            return Err(vm.new_overflow_error("timeout value is too large"));
+        }
+        let timeout_us = timeout_us as u64;
+
+        let (fd, _file) = get_fd_from_file_opt(args.file, vm)?;
+        let header = format_timeout(timeout_us);
+
+        // Snapshot thread frame slots so watchdog can dump tracebacks
+        #[cfg(feature = "threading")]
+        let thread_frame_slots: Vec<(u64, ThreadFrameSlot)> = {
+            let registry = vm.state.thread_frames.lock();
+            registry
+                .iter()
+                .map(|(&id, slot)| (id, Arc::clone(slot)))
+                .collect()
+        };
+
+        // Cancel any previous watchdog
+        cancel_dump_traceback_later();
+
+        // Create new watchdog state
+        let state = Arc::new((
+            Mutex::new(WatchdogState {
+                cancel: false,
+                fd,
+                timeout_us,
+                max_threads: if args.max_threads == 0 {
+                    100
+                } else {
+                    args.max_threads
+                },
+                repeat: args.repeat.into_bool(),
+                exit: args.exit.into_bool(),
+                header,
+                #[cfg(feature = "threading")]
+                thread_frame_slots,
+            }),
+            Condvar::new(),
+        ));
+
+        // Store the state
+        {
+            let mut watchdog = WATCHDOG.lock();
+            *watchdog = Some(Arc::clone(&state));
+        }
+
+        // Start watchdog thread
+        thread::spawn(move || {
+            watchdog_thread(state);
+        });
+
+        Ok(())
+    }
+
+    #[pyfunction]
+    fn cancel_dump_traceback_later() {
+        let state = {
+            let mut watchdog = WATCHDOG.lock();
+            watchdog.take()
+        };
+
+        if let Some(state) = state {
+            let (lock, cvar) = &*state;
+            {
+                let mut guard = lock.lock();
+                guard.cancel = true;
+            }
+            cvar.notify_all();
+        }
+    }
+
+    #[cfg(unix)]
+    extern "C" fn faulthandler_user_signal(signum: core::ffi::c_int) {
+        let save_errno = get_errno();
+
+        let user = match host_faulthandler::get_user_signal(signum as usize) {
+            Some(u) => u,
+            _ => {
+                set_errno(save_errno);
+                return;
+            }
+        };
+
+        faulthandler_dump_traceback(user.fd, user.all_threads);
+
+        if user.chain {
+            set_errno(save_errno);
+            let _ = host_faulthandler::reraise_user_signal(signum, faulthandler_user_signal);
+        }
+        set_errno(save_errno);
+    }
+
+    #[cfg(unix)]
+    fn check_signum(signum: i32, vm: &VirtualMachine) -> PyResult<()> {
+        // Check if it's a fatal signal (faulthandler.c uses faulthandler_handlers array)
+        if host_faulthandler::is_fatal_signal(signum) {
+            return Err(vm.new_runtime_error(format!(
+                "signal {signum} cannot be registered, use enable() instead"
+            )));
+        }
+
+        // Check if signal is in valid range
+        if !(1..64).contains(&signum) {
+            return Err(vm.new_value_error("signal number out of range"));
+        }
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[derive(FromArgs)]
+    #[allow(unused)]
+    struct RegisterArgs {
+        #[pyarg(any)]
+        signum: i32,
+        #[pyarg(any, default, py_default = "sys.stderr")]
+        file: OptionalArg<PyObjectRef>,
+        #[pyarg(any, default = ArgIntoBool::TRUE)]
+        all_threads: ArgIntoBool,
+        #[pyarg(any, default = ArgIntoBool::FALSE)]
+        chain: ArgIntoBool,
+    }
+
+    #[cfg(unix)]
+    #[pyfunction]
+    fn register(args: RegisterArgs, vm: &VirtualMachine) -> PyResult<()> {
+        check_signum(args.signum, vm)?;
+
+        let (fd, _file) = get_fd_from_file_opt(args.file, vm)?;
+
+        host_faulthandler::register_user_signal(
+            args.signum,
+            fd,
+            args.all_threads.into_bool(),
+            args.chain.into_bool(),
+            faulthandler_user_signal,
+        )
+        .map_err(|_| {
+            vm.new_os_error(format!(
+                "Failed to register signal handler for signal {}",
+                args.signum
+            ))
+        })?;
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[pyfunction]
+    fn unregister(signum: i32, vm: &VirtualMachine) -> PyResult<bool> {
+        check_signum(signum, vm)?;
+        Ok(host_faulthandler::unregister_user_signal(signum))
+    }
+
+    // Test functions for faulthandler testing
+
+    #[pyfunction]
+    fn _read_null(_vm: &VirtualMachine) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            suppress_crash_report();
+
+            unsafe {
+                let ptr: *const i32 = core::ptr::null();
+                core::ptr::read_volatile(ptr);
+            }
+        }
+    }
+
+    #[derive(FromArgs)]
+    #[allow(dead_code)]
+    struct SigsegvArgs {
+        #[pyarg(positional, default = ArgIntoBool::FALSE)]
+        release_gil: ArgIntoBool,
+    }
+
+    #[pyfunction]
+    fn _sigsegv(_args: SigsegvArgs, _vm: &VirtualMachine) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            suppress_crash_report();
+
+            // Write to NULL pointer to trigger a real hardware SIGSEGV,
+            // matching CPython's *((volatile int *)NULL) = 0;
+            // Using raise(SIGSEGV) doesn't work reliably because Rust's runtime
+            // installs its own signal handler that may swallow software signals.
+            unsafe {
+                let ptr: *mut i32 = core::ptr::null_mut();
+                core::ptr::write_volatile(ptr, 0);
+            }
+        }
+    }
+
+    #[pyfunction]
+    fn _sigabrt(_vm: &VirtualMachine) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            suppress_crash_report();
+            host_faulthandler::abort_process();
+        }
+    }
+
+    #[pyfunction]
+    fn _sigfpe(_vm: &VirtualMachine) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            suppress_crash_report();
+            host_faulthandler::raise_signal(host_faulthandler::SIGFPE);
+        }
+    }
+
+    #[pyfunction]
+    fn _fatal_error_c_thread() {
+        // This would call Py_FatalError in a new C thread
+        // For RustPython, we just panic in a new thread
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            suppress_crash_report();
+            std::thread::spawn(|| {
+                panic!("Fatal Python error: in new thread");
+            });
+            // Wait a bit for the thread to panic
+            std::thread::sleep(core::time::Duration::from_secs(1));
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn suppress_crash_report() {
+        #[cfg(windows)]
+        {
+            host_faulthandler::suppress_crash_report();
+        }
+
+        #[cfg(unix)]
+        {
+            #[cfg(not(any(target_os = "redox", target_os = "wasi")))]
+            {
+                rustpython_host_env::resource::disable_core_dumps();
+            }
+        }
+    }
+
+    // Windows-specific constants
+    #[cfg(windows)]
+    #[pyattr]
+    const _EXCEPTION_ACCESS_VIOLATION: u32 = host_faulthandler::EXCEPTION_ACCESS_VIOLATION;
+
+    #[cfg(windows)]
+    #[pyattr]
+    const _EXCEPTION_INT_DIVIDE_BY_ZERO: u32 = host_faulthandler::EXCEPTION_INT_DIVIDE_BY_ZERO;
+
+    #[cfg(windows)]
+    #[pyattr]
+    const _EXCEPTION_STACK_OVERFLOW: u32 = host_faulthandler::EXCEPTION_STACK_OVERFLOW;
+
+    #[cfg(windows)]
+    #[pyattr]
+    const _EXCEPTION_NONCONTINUABLE: u32 = host_faulthandler::EXCEPTION_NONCONTINUABLE;
+
+    #[cfg(windows)]
+    #[pyattr]
+    const _EXCEPTION_NONCONTINUABLE_EXCEPTION: u32 =
+        host_faulthandler::EXCEPTION_NONCONTINUABLE_EXCEPTION;
+
+    #[cfg(windows)]
+    #[derive(FromArgs)]
+    struct RaiseExceptionArgs {
+        #[pyarg(positional)]
+        code: u32,
+        #[pyarg(positional, default)]
+        flags: u32,
+    }
+
+    #[cfg(windows)]
+    #[pyfunction]
+    fn _raise_exception(args: RaiseExceptionArgs, _vm: &VirtualMachine) {
+        suppress_crash_report();
+        host_faulthandler::raise_exception(args.code, args.flags);
+    }
+
+    #[cfg(test)]
+    #[cfg(any(unix, windows))]
+    mod tests {
+        use super::*;
+        use std::sync::mpsc;
+        use std::time::Instant;
+
+        #[test]
+        fn watchdog_notification_does_not_expire_timeout() {
+            let state = Arc::new((
+                Mutex::new(WatchdogState {
+                    cancel: false,
+                    fd: 2,
+                    timeout_us: 60_000_000,
+                    max_threads: 100,
+                    repeat: false,
+                    exit: false,
+                    header: String::new(),
+                    #[cfg(feature = "threading")]
+                    thread_frame_slots: Vec::new(),
+                }),
+                Condvar::new(),
+            ));
+            let worker_state = Arc::clone(&state);
+            let (done_tx, done_rx) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                watchdog_thread(worker_state);
+                done_tx.send(()).unwrap();
+            });
+
+            // Wait for a real waiter so the notification cannot be lost before
+            // the watchdog starts. No Python frames are exposed to this worker.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let notified = loop {
+                if state.1.notify_one() {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                thread::sleep(Duration::from_millis(1));
+            };
+            let completed = done_rx.recv_timeout(Duration::from_millis(100));
+
+            // Always stop and join before asserting, including failure paths.
+            state.0.lock().cancel = true;
+            state.1.notify_all();
+            worker.join().unwrap();
+            assert!(notified, "watchdog did not start waiting");
+            assert!(matches!(completed, Err(mpsc::RecvTimeoutError::Timeout)));
+        }
+    }
+}

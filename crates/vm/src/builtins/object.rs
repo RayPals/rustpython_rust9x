@@ -1,0 +1,832 @@
+use super::{
+    PyAnyDict, PyDict, PyDictRef, PyList, PyStr, PyStrRef, PyType, PyTypeRef, PyUtf8StrRef,
+    builtin_func::PyNativeFunction, descriptor::PyMethodDescriptor,
+};
+use crate::common::hash::PyHash;
+use crate::types::PyTypeFlags;
+use crate::{
+    AsObject, Context, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyResult, VirtualMachine,
+    class::PyClassImpl,
+    convert::ToPyResult,
+    function::{
+        ArgumentError, Either, FromArgs, FuncArgs, Param, PyArithmeticValue, PyComparisonValue,
+        PySetterValue,
+    },
+    types::{Constructor, Initializer, PyComparisonOp},
+    vm::PyMethod,
+};
+use itertools::Itertools;
+
+#[pyclass(module = false, name = "object")]
+#[derive(Debug, Default)]
+pub struct PyBaseObject;
+
+impl PyPayload for PyBaseObject {
+    #[inline]
+    fn class(ctx: &Context) -> &'static Py<PyType> {
+        ctx.types.object_type
+    }
+}
+
+pub struct ObjectArgs;
+
+impl FromArgs for ObjectArgs {
+    // The constructor slots decide acceptance from the class's __new__/__init__.
+    const BINDING_PARAMS: Option<&'static [Param]> = FuncArgs::BINDING_PARAMS;
+
+    const PARAMS: Option<&'static [Param]> = Some(&[]);
+
+    fn from_args(_vm: &VirtualMachine, args: &mut FuncArgs) -> Result<Self, ArgumentError> {
+        core::mem::take(args);
+        Ok(Self)
+    }
+}
+
+impl Constructor for PyBaseObject {
+    type Args = ObjectArgs;
+
+    // = object_new
+    fn slot_new(cls: PyTypeRef, args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+        if !args.args.is_empty() || !args.kwargs.is_empty() {
+            // Check if type's __new__ != object.__new__
+            let tp_new = cls.get_attr(identifier!(vm, __new__));
+            let object_new = vm.ctx.types.object_type.get_attr(identifier!(vm, __new__));
+
+            if let (Some(tp_new), Some(object_new)) = (tp_new, object_new) {
+                if !tp_new.is(&object_new) {
+                    // Type has its own __new__, so object.__new__ is being called
+                    // with excess args. This is the first error case in CPython
+                    return Err(vm.new_type_error(
+                        "object.__new__() takes exactly one argument (the type to instantiate)",
+                    ));
+                }
+
+                // If we reach here, tp_new == object_new
+                // Now check if type's __init__ == object.__init__
+                let tp_init = cls.get_attr(identifier!(vm, __init__));
+                let object_init = vm.ctx.types.object_type.get_attr(identifier!(vm, __init__));
+
+                if let (Some(tp_init), Some(object_init)) = (tp_init, object_init)
+                    && tp_init.is(&object_init)
+                {
+                    // Both __new__ and __init__ are object's versions,
+                    // so the type accepts no arguments
+                    return Err(
+                        vm.new_type_error(format!("{}() takes no arguments", cls.slot_name()))
+                    );
+                }
+                // If tp_init != object_init, then the type has custom __init__
+                // which might accept arguments, so we allow it
+            }
+        }
+
+        // Ensure that all abstract methods are implemented before instantiating instance.
+        if let Some(abs_methods) = cls.get_attr(identifier!(vm, __abstractmethods__)) {
+            let methods: Vec<PyUtf8StrRef> = abs_methods.try_to_value(vm)?;
+            let unimplemented_abstract_method_count = methods.len();
+            if unimplemented_abstract_method_count > 0 {
+                let methods: String = Itertools::intersperse(
+                    methods.iter().map(|name| name.as_str().to_owned()),
+                    "', '".to_owned(),
+                )
+                .collect();
+                let name = cls.name().to_string();
+                let noun = if unimplemented_abstract_method_count == 1 {
+                    "method"
+                } else {
+                    "methods"
+                };
+                return Err(vm.new_type_error(format!(
+                    "class {name} without an implementation for abstract {noun} '{methods}'"
+                )));
+            }
+        }
+
+        // Every type inherits tp_alloc via set_alloc; object keeps generic_alloc.
+        let alloc = cls.slots.alloc.load().unwrap_or(generic_alloc);
+        alloc(cls, 0, vm)
+    }
+
+    fn py_new(_cls: &Py<PyType>, _args: Self::Args, _vm: &VirtualMachine) -> PyResult<Self> {
+        unimplemented!("use slot_new")
+    }
+}
+
+/// Allocate `T::default()` with the same HAS_DICT handling as object tp_alloc.
+pub fn alloc_default<T: PyPayload + Default + core::fmt::Debug>(
+    cls: PyTypeRef,
+    _nitems: usize,
+    vm: &VirtualMachine,
+) -> PyResult {
+    // Only create dict if the class has HAS_DICT flag (i.e., __slots__ was not defined
+    // or __dict__ is in __slots__)
+    let dict = if cls.slots.flags.has_feature(PyTypeFlags::HAS_DICT) {
+        Some(vm.ctx.new_dict())
+    } else {
+        None
+    };
+    Ok(crate::PyRef::new_ref(T::default(), cls, dict).into())
+}
+
+pub(crate) fn generic_alloc(cls: PyTypeRef, nitems: usize, vm: &VirtualMachine) -> PyResult {
+    alloc_default::<PyBaseObject>(cls, nitems, vm)
+}
+
+impl Initializer for PyBaseObject {
+    type Args = ObjectArgs;
+
+    // object_init: excess_args validation
+    fn slot_init(zelf: &PyObject, args: FuncArgs, vm: &VirtualMachine) -> PyResult<()> {
+        if args.is_empty() {
+            return Ok(());
+        }
+
+        let typ = zelf.class();
+        let object_type = &vm.ctx.types.object_type;
+
+        let typ_init = typ.slots.init.load().map(|f| crate::types::fn_addr(f));
+        let object_init = object_type
+            .slots
+            .init
+            .load()
+            .map(|f| crate::types::fn_addr(f));
+
+        // if (type->tp_init != object_init) → first error
+        if typ_init != object_init {
+            return Err(vm.new_type_error(
+                "object.__init__() takes exactly one argument (the instance to initialize)",
+            ));
+        }
+
+        // if (type->tp_new == object_new) → second error
+        if let (Some(typ_new), Some(object_new)) = (
+            typ.get_attr(identifier!(vm, __new__)),
+            object_type.get_attr(identifier!(vm, __new__)),
+        ) && typ_new.is(&object_new)
+        {
+            return Err(vm.new_type_error(format!(
+                "{}.__init__() takes exactly one argument (the instance to initialize)",
+                typ.slot_name()
+            )));
+        }
+
+        // Both conditions false → OK (e.g., tuple, dict with custom __new__)
+        Ok(())
+    }
+
+    fn init(_zelf: &Py<Self>, _args: Self::Args, _vm: &VirtualMachine) -> PyResult<()> {
+        unreachable!("slot_init is defined")
+    }
+}
+
+// _PyType_GetSlotNames
+fn type_slot_names(typ: &Py<PyType>, vm: &VirtualMachine) -> PyResult<Option<super::PyListRef>> {
+    // The class caches its slot names in `__slotnames__`.
+    if let Some(slot_names) = typ.get_direct_attr(identifier!(vm.ctx, __slotnames__)) {
+        return match_class!(match slot_names {
+            l @ super::PyList => Ok(Some(l)),
+            _n @ super::PyNone => Ok(None),
+            other => Err(vm.new_type_error(format!(
+                "{:.200}.__slotnames__ should be a list or None, not {:.200}",
+                typ.name(),
+                other.class().name()
+            ))),
+        });
+    }
+
+    // copyreg._slotnames collects the slots of the class and its bases and
+    // caches them in `__slotnames__`.
+    let copyreg = vm.import("copyreg", 0)?;
+    let copyreg_slotnames = copyreg.get_attr("_slotnames", vm)?;
+    let slot_names = copyreg_slotnames.call((typ.to_owned(),), vm)?;
+    let result = match_class!(match slot_names {
+        l @ super::PyList => Some(l),
+        _n @ super::PyNone => None,
+        _ => return Err(vm.new_type_error("copyreg._slotnames didn't return a list or None")),
+    });
+    Ok(result)
+}
+
+// object_getstate_default
+fn object_getstate_default(obj: &PyObject, required: bool, vm: &VirtualMachine) -> PyResult {
+    // Check itemsize
+    if required && obj.class().slots().itemsize > 0 {
+        return Err(vm.new_type_error(format!("cannot pickle {:.200} objects", obj.class().name())));
+    }
+
+    let state = if obj.dict().is_none_or(|d| d.is_empty()) {
+        vm.ctx.none()
+    } else {
+        // let state = object_get_dict(obj.clone(), obj.ctx()).unwrap();
+        let Some(state) = obj.dict() else {
+            return Ok(vm.ctx.none());
+        };
+        state.into()
+    };
+
+    let slot_names = type_slot_names(obj.class(), vm)?;
+
+    if required {
+        // Dict, weakref list, and slot cells sit in the prefix in front of
+        // the object header. `slots.basicsize` is the header plus the payload,
+        // so only state stored inside the payload counts.
+        let basicsize = vm.ctx.types.object_type.slots().basicsize;
+        if obj.class().slots().basicsize > basicsize {
+            return Err(vm.new_type_error(format!("cannot pickle '{}' object", obj.class().name())));
+        }
+    }
+
+    if let Some(slot_names) = slot_names {
+        let slot_names_len = slot_names.__len__();
+        if slot_names_len > 0 {
+            let slots = vm.ctx.new_dict();
+            let outcome = (|| {
+                for i in 0..slot_names_len {
+                    // Release the list lock before the attribute lookup: a getter
+                    // or `__getattr__` may mutate `__slotnames__`.
+                    let name = slot_names.borrow_vec().get(i).cloned();
+                    let name = name.ok_or_else(|| {
+                        vm.new_runtime_error("__slotnames__ changed size during iteration")
+                    })?;
+                    let name = name.downcast::<PyStr>().map_err(|name| {
+                        vm.new_type_error(format!(
+                            "attribute name must be string, not '{}'",
+                            name.class().name()
+                        ))
+                    })?;
+                    if let Some(value) = vm.get_attribute_opt(obj, &name)? {
+                        // Keep the original key and both owners through insertion.
+                        let (_value, name) = (value.clone(), name);
+                        let inserted = slots.set_item(name.as_object(), value, vm);
+                        drop(name);
+                        inserted?;
+                    } else {
+                        drop(name);
+                    }
+                    // The list is stored on the class, so it may change while we
+                    // iterate over it, including when the name is released.
+                    if slot_names.borrow_vec().len() != slot_names_len {
+                        return Err(
+                            vm.new_runtime_error("__slotnames__ changed size during iteration")
+                        );
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(exc) = outcome {
+                drop(slot_names);
+                drop(slots);
+                return Err(exc);
+            }
+
+            if !slots.is_empty() {
+                return (state, slots).to_pyresult(vm);
+            }
+        }
+    }
+
+    Ok(state)
+}
+
+#[pyclass(with(Constructor, Initializer), flags(BASETYPE))]
+impl PyBaseObject {
+    #[pymethod]
+    fn __getstate__(zelf: PyObjectRef, vm: &VirtualMachine) -> PyResult {
+        object_getstate_default(&zelf, false, vm)
+    }
+
+    #[pyslot]
+    fn slot_richcompare(
+        zelf: &PyObject,
+        other: &PyObject,
+        op: PyComparisonOp,
+        vm: &VirtualMachine,
+    ) -> PyResult<Either<PyObjectRef, PyComparisonValue>> {
+        Self::cmp(zelf, other, op, vm).map(Either::B)
+    }
+
+    #[inline(always)]
+    fn cmp(
+        zelf: &PyObject,
+        other: &PyObject,
+        op: PyComparisonOp,
+        vm: &VirtualMachine,
+    ) -> PyResult<PyComparisonValue> {
+        let res = match op {
+            PyComparisonOp::Eq => {
+                if zelf.is(other) {
+                    PyComparisonValue::Implemented(true)
+                } else {
+                    PyComparisonValue::NotImplemented
+                }
+            }
+            PyComparisonOp::Ne => {
+                let cmp = zelf.class().slots().richcompare.load().unwrap();
+                let value = match cmp(zelf, other, PyComparisonOp::Eq, vm)? {
+                    Either::A(obj) => PyArithmeticValue::from_object(vm, obj)
+                        .map(|obj| obj.try_to_bool(vm))
+                        .transpose()?,
+                    Either::B(value) => value,
+                };
+                value.map(|v| !v)
+            }
+            _ => PyComparisonValue::NotImplemented,
+        };
+        Ok(res)
+    }
+
+    // __setattr__ and __delattr__ are added as slot wrappers by add_operators.
+    #[pyslot]
+    pub(crate) fn slot_setattro(
+        obj: &PyObject,
+        attr_name: &Py<PyStr>,
+        value: PySetterValue,
+        vm: &VirtualMachine,
+    ) -> PyResult<()> {
+        obj.generic_setattr(attr_name, value, vm)
+    }
+
+    // Return str(self).
+    #[pyslot]
+    fn slot_str(zelf: &PyObject, vm: &VirtualMachine) -> PyResult<PyStrRef> {
+        // FIXME: try tp_repr first and fallback to object.__repr__
+        zelf.repr(vm)
+    }
+
+    #[pyslot]
+    fn slot_repr(zelf: &PyObject, vm: &VirtualMachine) -> PyResult<PyStrRef> {
+        let class = zelf.class();
+        // A missing `__module__` is not an error here.
+        let module = class.__module__(vm).ok();
+        match (
+            class
+                .__qualname__(vm)
+                .downcast_ref::<PyStr>()
+                .map(|n| n.as_wtf8()),
+            module
+                .as_ref()
+                .and_then(|m| m.downcast_ref::<PyStr>())
+                .map(|m| m.as_wtf8()),
+        ) {
+            (None, _) => Err(vm.new_type_error("Unknown qualified name")),
+            (Some(qualname), Some(module)) if module != "builtins" => Ok(PyStr::from(format!(
+                "<{}.{} object at {:#x}>",
+                module,
+                qualname,
+                zelf.get_id()
+            ))
+            .into_ref(&vm.ctx)),
+            _ => Ok(PyStr::from(format!(
+                "<{} object at {:#x}>",
+                class.slot_name(),
+                zelf.get_id()
+            ))
+            .into_ref(&vm.ctx)),
+        }
+    }
+
+    #[pyclassmethod]
+    fn __subclasshook__(_cls: PyTypeRef, _object: PyObjectRef, vm: &VirtualMachine) -> PyObjectRef {
+        vm.ctx.not_implemented()
+    }
+
+    #[pyclassmethod]
+    fn __init_subclass__(_cls: PyTypeRef) {}
+
+    #[pymethod]
+    pub fn __dir__(zelf: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyList> {
+        let dict = match vm.get_attribute_opt(&zelf, identifier!(vm, __dict__))? {
+            Some(obj) => match obj.downcast::<PyDict>() {
+                Ok(dict) => PyRef::<PyAnyDict>::from(dict).copy_as_dict(vm)?,
+                Err(_) => PyDict::default(),
+            },
+            None => PyDict::default(),
+        };
+        let class = vm.get_attribute_opt(&zelf, identifier!(vm, __class__))?;
+        if let Some(class) = &class {
+            merge_class_dict(&dict, class, vm)?;
+        }
+        Ok(PyList::from(dict.keys_vec()))
+    }
+
+    #[pymethod]
+    fn __format__(
+        obj: PyObjectRef,
+        format_spec: PyStrRef,
+        vm: &VirtualMachine,
+    ) -> PyResult<PyStrRef> {
+        if !format_spec.is_empty() {
+            return Err(vm.new_type_error(format!(
+                "unsupported format string passed to {}.__format__",
+                obj.class().slot_name()
+            )));
+        }
+        obj.str(vm)
+    }
+
+    #[pygetset]
+    fn __class__(obj: PyObjectRef) -> PyTypeRef {
+        obj.class().to_owned()
+    }
+
+    #[pygetset(setter)]
+    fn set___class__(
+        instance: PyObjectRef,
+        value: PySetterValue,
+        vm: &VirtualMachine,
+    ) -> PyResult<()> {
+        let value = value.ok_or_else(|| vm.new_type_error("can't delete __class__ attribute"))?;
+        match value.downcast::<PyType>() {
+            Ok(cls) => {
+                vm.audit("object.__setattr__", || {
+                    (instance.clone(), "__class__", cls.clone())
+                })?;
+                let current_cls = instance.class();
+                let both_module = current_cls.fast_issubclass(vm.ctx.types.module_type)
+                    && cls.fast_issubclass(vm.ctx.types.module_type);
+                let both_mutable = !current_cls
+                    .slots
+                    .flags
+                    .has_feature(PyTypeFlags::IMMUTABLETYPE)
+                    && !cls.slots.flags.has_feature(PyTypeFlags::IMMUTABLETYPE);
+                // FIXME(#1979) cls instances might have a payload
+                if both_mutable || both_module {
+                    super::type_::compatible_for_assignment(
+                        current_cls,
+                        &cls,
+                        "__class__",
+                        true,
+                        vm,
+                    )?;
+                    instance.set_class(cls, vm);
+                    crate::stdlib::_testinternalcapi::note_set_class();
+                    Ok(())
+                } else {
+                    Err(vm.new_type_error(
+                        "__class__ assignment only supported for mutable types or ModuleType subclasses",
+                    ))
+                }
+            }
+            Err(value) => {
+                let value_class = value.class();
+                let type_repr = &value_class.name();
+                Err(vm.new_type_error(format!(
+                    "__class__ must be set to a class, not '{type_repr}' object"
+                )))
+            }
+        }
+    }
+
+    // Return getattr(self, name).
+    //
+    // __getattribute__ is added as a slot wrapper by add_operators.
+    #[pyslot]
+    pub(crate) fn getattro(obj: &PyObject, name: &Py<PyStr>, vm: &VirtualMachine) -> PyResult {
+        vm_trace!("object.__getattribute__({:?}, {:?})", obj, name);
+        obj.as_object().generic_getattr(name, vm)
+    }
+
+    #[pymethod]
+    fn __reduce__(zelf: PyObjectRef, vm: &VirtualMachine) -> PyResult {
+        common_reduce(zelf, 0, vm)
+    }
+
+    #[pymethod]
+    fn __reduce_ex__(zelf: PyObjectRef, protocol: PyObjectRef, vm: &VirtualMachine) -> PyResult {
+        // Keep the original argument alive through reducer lookup and dispatch.
+        let protocol_number = protocol
+            .try_index(vm)?
+            .try_to_primitive::<i32>(vm)
+            .map_err(|_| vm.new_overflow_error("Python int too large to convert to C int"))?;
+        let __reduce__ = identifier!(vm, __reduce__);
+        if let Some(reduce) = vm.get_attribute_opt(&zelf, __reduce__)? {
+            let object_reduce = vm.ctx.types.object_type.get_attr(__reduce__).unwrap();
+            let typ_obj: PyObjectRef = zelf.class().to_owned().into();
+            let class_reduce = typ_obj.get_attr(__reduce__, vm)?;
+            let overridden = !class_reduce.is(&object_reduce);
+            drop(class_reduce);
+            drop(typ_obj);
+            if overridden {
+                return reduce.call((), vm);
+            }
+        }
+        common_reduce(zelf, protocol_number, vm)
+    }
+
+    #[expect(clippy::unnecessary_wraps, reason = "Needs to comply with a signature")]
+    #[pyslot]
+    fn slot_hash(zelf: &PyObject, _vm: &VirtualMachine) -> PyResult<PyHash> {
+        Ok(zelf.get_id() as _)
+    }
+
+    #[pymethod]
+    fn __sizeof__(zelf: PyObjectRef) -> usize {
+        // `slots.basicsize` includes the object header. This reports the payload.
+        zelf.class()
+            .slots()
+            .basicsize
+            .saturating_sub(crate::object::SIZEOF_PYOBJECT_HEAD)
+    }
+}
+
+pub(crate) fn merge_class_dict(
+    dict: &PyDict,
+    class: &PyObject,
+    vm: &VirtualMachine,
+) -> PyResult<()> {
+    vm.with_recursion(" while collecting directory entries", || {
+        if let Some(class_dict) = vm.get_attribute_opt(class, identifier!(vm, __dict__))? {
+            dict.merge_mapping(class_dict, vm)?;
+        }
+        if let Some(bases) = vm.get_attribute_opt(class, identifier!(vm, __bases__))? {
+            let sequence = bases.sequence_unchecked();
+            for index in 0..sequence.length(vm)? {
+                let base = sequence.get_item(index as isize, vm)?;
+                merge_class_dict(dict, &base, vm)?;
+            }
+        }
+        Ok(())
+    })
+}
+
+pub fn object_get_dict(obj: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyDictRef> {
+    if let Some(dict) = obj.dict() {
+        Ok(dict)
+    } else {
+        match obj.instance_dict() {
+            Some(d) => Ok(d.get_or_insert(vm)),
+            None => Err(vm.new_attribute_error("This object has no __dict__")),
+        }
+    }
+}
+pub(crate) fn object_set_dict(
+    obj: PyObjectRef,
+    value: PySetterValue,
+    vm: &VirtualMachine,
+) -> PyResult<()> {
+    let dict = match value {
+        PySetterValue::Assign(value) => Some(downcast_dict(value, vm)?),
+        PySetterValue::Delete => None,
+    };
+    if let Some(instance_dict) = obj.instance_dict() {
+        instance_dict.invalidate_inline_values();
+    }
+    obj.set_dict(dict)
+        .map_err(|_| vm.new_attribute_error("This object has no __dict__"))
+}
+
+/// The dictionary an object holds its attributes in, which is one thing and
+/// one thing only. = subtype_setdict
+fn downcast_dict(value: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyDictRef> {
+    value.downcast::<PyDict>().map_err(|value| {
+        vm.new_type_error(format!(
+            "__dict__ must be set to a dictionary, not a '{}'",
+            value.class().name()
+        ))
+    })
+}
+
+/// = PyObject_GenericSetDict
+pub fn object_generic_set_dict(
+    obj: PyObjectRef,
+    value: PySetterValue,
+    vm: &VirtualMachine,
+) -> PyResult<()> {
+    if matches!(value, PySetterValue::Delete) {
+        return Err(vm.new_type_error("cannot delete __dict__"));
+    }
+    object_set_dict(obj, value, vm)
+}
+
+pub(crate) fn init(ctx: &'static Context) {
+    // Manually set alloc/init slots - derive macro doesn't generate extend_slots
+    // for trait impl that overrides #[pyslot] method
+    ctx.types
+        .object_type
+        .slots()
+        .alloc
+        .store(Some(generic_alloc));
+    ctx.types
+        .object_type
+        .slots
+        .init
+        .store(Some(<PyBaseObject as Initializer>::slot_init));
+    PyBaseObject::extend_class(ctx, ctx.types.object_type);
+}
+
+/// Get arguments for __new__ from __getnewargs_ex__ or __getnewargs__
+/// Returns (args, kwargs) tuple where either can be None
+fn get_new_arguments(
+    obj: &PyObject,
+    vm: &VirtualMachine,
+) -> PyResult<(Option<super::PyTupleRef>, Option<super::PyDictRef>)> {
+    // First try __getnewargs_ex__
+    if let Some(getnewargs_ex) =
+        PyMethod::get_special_ex::<false>(obj, identifier!(vm, __getnewargs_ex__), vm, true)?
+    {
+        let newargs = getnewargs_ex.invoke((), vm)?;
+
+        let newargs_tuple: PyRef<super::PyTuple> = newargs.downcast().map_err(|obj| {
+            vm.new_type_error(format!(
+                "__getnewargs_ex__ should return a tuple, not '{}'",
+                obj.class().name()
+            ))
+        })?;
+
+        if newargs_tuple.as_slice().len() != 2 {
+            return Err(vm.new_value_error(format!(
+                "__getnewargs_ex__ should return a tuple of length 2, not {}",
+                newargs_tuple.as_slice().len()
+            )));
+        }
+
+        let args = newargs_tuple.as_slice()[0].clone();
+        let kwargs = newargs_tuple.as_slice()[1].clone();
+        // Releasing the outer tuple can run Python before its items are checked.
+        drop(newargs_tuple);
+
+        let args_tuple = match args.downcast::<super::PyTuple>() {
+            Ok(args) => args,
+            Err(args) => {
+                let exc = vm.new_type_error(format!(
+                    "first item of the tuple returned by __getnewargs_ex__ must be a tuple, not '{}'",
+                    args.class().name()
+                ));
+                return Err(exc);
+            }
+        };
+
+        let kwargs_dict = match kwargs.downcast::<super::PyDict>() {
+            Ok(kwargs) => kwargs,
+            Err(kwargs) => {
+                let exc = vm.new_type_error(format!(
+                    "second item of the tuple returned by __getnewargs_ex__ must be a dict, not '{}'",
+                    kwargs.class().name()
+                ));
+                drop(args_tuple);
+                return Err(exc);
+            }
+        };
+
+        return Ok((Some(args_tuple), Some(kwargs_dict)));
+    }
+
+    // Fall back to __getnewargs__
+    if let Some(getnewargs) =
+        PyMethod::get_special_ex::<false>(obj, identifier!(vm, __getnewargs__), vm, true)?
+    {
+        let args = getnewargs.invoke((), vm)?;
+
+        let args_tuple: PyRef<super::PyTuple> = args.downcast().map_err(|obj| {
+            vm.new_type_error(format!(
+                "__getnewargs__ should return a tuple, not '{}'",
+                obj.class().name()
+            ))
+        })?;
+
+        return Ok((Some(args_tuple), None));
+    }
+
+    // No __getnewargs_ex__ or __getnewargs__
+    Ok((None, None))
+}
+
+/// object_getstate - calls __getstate__ method or default implementation
+fn object_getstate(obj: &PyObject, required: bool, vm: &VirtualMachine) -> PyResult {
+    let getstate = obj.get_attr(identifier!(vm, __getstate__), vm)?;
+    // Only the original built-in bound to this object receives `required`.
+    // Instance attributes and custom lookup must run before this distinction.
+    let is_default =
+        getstate
+            .downcast_ref::<PyNativeFunction>()
+            .is_some_and(|method| {
+                method.get_self().is_some_and(|bound| bound.is(obj))
+                    && vm
+                        .ctx
+                        .types
+                        .object_type
+                        .get_attr(identifier!(vm, __getstate__))
+                        .is_some_and(|descriptor| {
+                            descriptor.downcast_ref::<PyMethodDescriptor>().is_some_and(
+                                |descriptor| core::ptr::eq(method.value, descriptor.method),
+                            )
+                        })
+            });
+    if is_default {
+        object_getstate_default(obj, required, vm)
+    } else {
+        getstate.call((), vm)
+    }
+}
+
+/// Get list items iterator if obj is a list (or subclass), None iterator otherwise
+fn get_items_iter(obj: &PyObject, vm: &VirtualMachine) -> PyResult<(PyObjectRef, PyObjectRef)> {
+    let listitems: PyObjectRef = if obj.fast_isinstance(vm.ctx.types.list_type) {
+        obj.get_iter(vm)?.into()
+    } else {
+        vm.ctx.none()
+    };
+
+    let dictitems: PyObjectRef = if obj.fast_isinstance(vm.ctx.types.dict_type) {
+        let items = vm.call_method(obj, "items", ())?;
+        items.get_iter(vm)?.into()
+    } else {
+        vm.ctx.none()
+    };
+
+    Ok((listitems, dictitems))
+}
+
+/// reduce_newobj - creates reduce tuple for protocol >= 2
+fn reduce_newobj(obj: &PyObject, vm: &VirtualMachine) -> PyResult {
+    // Check if type has tp_new
+    if obj.class().slots.new.load().is_none() {
+        return Err(vm.new_type_error(format!("cannot pickle '{}' object", obj.class().name())));
+    }
+
+    let (args, kwargs) = get_new_arguments(obj, vm)?;
+
+    let copyreg = match vm.import("copyreg", 0) {
+        Ok(copyreg) => copyreg,
+        Err(exc) => {
+            drop(args);
+            return Err(exc);
+        }
+    };
+
+    let has_args = args.is_some();
+
+    let (newobj, newargs): (PyObjectRef, PyObjectRef) = match kwargs {
+        Some(kwargs) if !kwargs.is_empty() => {
+            // args == NULL with non-empty kwargs is BadInternalCall
+            let Some(args) = args else {
+                drop(copyreg);
+                drop(kwargs);
+                return Err(vm.new_system_error("bad internal call"));
+            };
+            // Use copyreg.__newobj_ex__
+            let newobj = copyreg.get_attr("__newobj_ex__", vm);
+            drop(copyreg);
+            let newobj = newobj?;
+            let newargs = vm.ctx.new_tuple(vec![
+                obj.class().to_owned().into(),
+                args.into(),
+                kwargs.into(),
+            ]);
+            (newobj, newargs.into())
+        }
+        kwargs => {
+            // Empty kwargs are released before looking up copyreg.__newobj__.
+            drop(kwargs);
+            let newobj = copyreg.get_attr("__newobj__", vm);
+            drop(copyreg);
+            let newobj = newobj?;
+            // Create (cls, *args) after callbacks, but before releasing args.
+            let mut newargs_vec = vec![obj.class().to_owned().into()];
+            if let Some(args) = &args {
+                newargs_vec.extend_from_slice(args.as_slice());
+            }
+            let newargs = vm.ctx.new_tuple(newargs_vec);
+            drop(args);
+            (newobj, newargs.into())
+        }
+    };
+
+    // Determine if state is required
+    // required = !(has_args || is_list || is_dict)
+    let is_list = obj.fast_isinstance(vm.ctx.types.list_type);
+    let is_dict = obj.fast_isinstance(vm.ctx.types.dict_type);
+    let required = !(has_args || is_list || is_dict);
+
+    let state = match object_getstate(obj, required, vm) {
+        Ok(state) => state,
+        Err(exc) => {
+            drop(newobj);
+            return Err(exc);
+        }
+    };
+
+    let (listitems, dictitems) = match get_items_iter(obj, vm) {
+        Ok(items) => items,
+        Err(exc) => {
+            drop(newobj);
+            drop(newargs);
+            return Err(exc);
+        }
+    };
+
+    let result = vm
+        .ctx
+        .new_tuple(vec![newobj, newargs, state, listitems, dictitems]);
+    Ok(result.into())
+}
+
+fn common_reduce(obj: PyObjectRef, proto: i32, vm: &VirtualMachine) -> PyResult {
+    if proto >= 2 {
+        reduce_newobj(&obj, vm)
+    } else {
+        let copyreg = vm.import("copyreg", 0)?;
+        let reduce_ex = copyreg.get_attr("_reduce_ex", vm)?;
+        reduce_ex.call((obj, proto), vm)
+    }
+}

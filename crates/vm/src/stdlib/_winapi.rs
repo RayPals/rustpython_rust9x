@@ -1,0 +1,1357 @@
+// spell-checker:disable
+
+#![allow(non_snake_case)]
+pub(crate) use _winapi::module_def;
+
+#[pymodule]
+mod _winapi {
+    use crate::{
+        AsObject, Py, PyObjectRef, PyPayload, PyResult, TryFromObject, VirtualMachine,
+        builtins::PyStrRef,
+        common::lock::{PyMutex, PyMutexGuard},
+        convert::{ToPyException, ToPyObject},
+        exceptions::nul_char_error,
+        function::{ArgBytesLike, ArgMapping, ArgSequence, OptionalArg},
+        types::Constructor,
+        windows::{WinHandle, WindowsSysResult},
+    };
+    use core::ptr::null_mut;
+    use num_traits::ToPrimitive;
+    use rustpython_common::wtf8::Wtf8Buf;
+    use rustpython_host_env::overlapped as host_overlapped;
+    use rustpython_host_env::winapi as host_winapi;
+    use rustpython_host_env::windows::ToWideString;
+
+    // Argument Clinic converts LPCWSTR arguments in positional order. Keep the
+    // conversion here, not in the body after later __index__ calls can run.
+    struct ArgWideString {
+        wide: widestring::WideCString,
+        // Argument Clinic keeps the original argument alive through the call.
+        _owner: PyStrRef,
+    }
+
+    impl TryFromObject for ArgWideString {
+        fn try_from_object(vm: &VirtualMachine, obj: PyObjectRef) -> PyResult<Self> {
+            let value = PyStrRef::try_from_object(vm, obj)?;
+            let wide = value
+                .as_wtf8()
+                .to_wide_cstring()
+                .map_err(|_| nul_char_error(vm))?;
+            Ok(Self {
+                wide,
+                _owner: value,
+            })
+        }
+    }
+
+    fn audit_wide(value: Option<&widestring::WideCStr>, vm: &VirtualMachine) -> PyObjectRef {
+        value.map_or_else(
+            || vm.ctx.none(),
+            |value| vm.ctx.new_str(Wtf8Buf::from_wide(value.as_slice())).into(),
+        )
+    }
+
+    #[pyattr]
+    use host_winapi::{
+        ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS,
+        COPY_FILE_ALLOW_DECRYPTED_DESTINATION, COPY_FILE_COPY_SYMLINK, COPY_FILE_DIRECTORY,
+        COPY_FILE_FAIL_IF_EXISTS, COPY_FILE_NO_BUFFERING, COPY_FILE_NO_OFFLOAD,
+        COPY_FILE_OPEN_SOURCE_FOR_WRITE, COPY_FILE_REQUEST_COMPRESSED_TRAFFIC,
+        COPY_FILE_REQUEST_SECURITY_PRIVILEGES, COPY_FILE_RESTARTABLE, COPY_FILE_RESUME_FROM_PAUSE,
+        COPYFILE2_CALLBACK_CHUNK_FINISHED, COPYFILE2_CALLBACK_CHUNK_STARTED,
+        COPYFILE2_CALLBACK_ERROR, COPYFILE2_CALLBACK_POLL_CONTINUE,
+        COPYFILE2_CALLBACK_STREAM_FINISHED, COPYFILE2_CALLBACK_STREAM_STARTED,
+        COPYFILE2_PROGRESS_CANCEL, COPYFILE2_PROGRESS_CONTINUE, COPYFILE2_PROGRESS_PAUSE,
+        COPYFILE2_PROGRESS_QUIET, COPYFILE2_PROGRESS_STOP, CREATE_BREAKAWAY_FROM_JOB,
+        CREATE_DEFAULT_ERROR_MODE, CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
+        DETACHED_PROCESS, DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, ERROR_ACCESS_DENIED,
+        ERROR_ALREADY_EXISTS, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_MORE_DATA,
+        ERROR_NETNAME_DELETED, ERROR_NO_DATA, ERROR_NO_SYSTEM_RESOURCES, ERROR_OPERATION_ABORTED,
+        ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_PRIVILEGE_NOT_HELD, ERROR_SEM_TIMEOUT,
+        EVENTLOG_AUDIT_FAILURE, EVENTLOG_AUDIT_SUCCESS, EVENTLOG_ERROR_TYPE,
+        EVENTLOG_INFORMATION_TYPE, EVENTLOG_SUCCESS, EVENTLOG_WARNING_TYPE,
+        FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+        FILE_MAP_ALL_ACCESS, FILE_MAP_COPY, FILE_MAP_EXECUTE, FILE_MAP_READ, FILE_MAP_WRITE,
+        FILE_TYPE_CHAR, FILE_TYPE_DISK, FILE_TYPE_PIPE, FILE_TYPE_REMOTE, FILE_TYPE_UNKNOWN,
+        GENERIC_READ, GENERIC_WRITE, HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, LCMAP_FULLWIDTH,
+        LCMAP_HALFWIDTH, LCMAP_HIRAGANA, LCMAP_KATAKANA, LCMAP_LINGUISTIC_CASING, LCMAP_LOWERCASE,
+        LCMAP_SIMPLIFIED_CHINESE, LCMAP_TITLECASE, LCMAP_TRADITIONAL_CHINESE, LCMAP_UPPERCASE,
+        LOCALE_NAME_MAX_LENGTH, MEM_COMMIT, MEM_FREE, MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE,
+        MEM_RESERVE, NMPWAIT_WAIT_FOREVER, NORMAL_PRIORITY_CLASS, OPEN_EXISTING, PAGE_EXECUTE,
+        PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD,
+        PAGE_NOACCESS, PAGE_NOCACHE, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOMBINE,
+        PAGE_WRITECOPY, PIPE_ACCESS_DUPLEX, PIPE_ACCESS_INBOUND, PIPE_READMODE_MESSAGE,
+        PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, PROCESS_ALL_ACCESS,
+        PROCESS_DUP_HANDLE, REALTIME_PRIORITY_CLASS, SEC_COMMIT, SEC_IMAGE, SEC_LARGE_PAGES,
+        SEC_NOCACHE, SEC_RESERVE, SEC_WRITECOMBINE, STARTF_FORCEOFFFEEDBACK,
+        STARTF_FORCEONFEEDBACK, STARTF_PREVENTPINNING, STARTF_RUNFULLSCREEN, STARTF_TITLEISAPPID,
+        STARTF_TITLEISLINKNAME, STARTF_UNTRUSTEDSOURCE, STARTF_USECOUNTCHARS,
+        STARTF_USEFILLATTRIBUTE, STARTF_USEHOTKEY, STARTF_USEPOSITION, STARTF_USESHOWWINDOW,
+        STARTF_USESIZE, STARTF_USESTDHANDLES, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
+        STD_OUTPUT_HANDLE, STILL_ACTIVE, SW_HIDE, SYNCHRONIZE, WAIT_ABANDONED_0, WAIT_OBJECT_0,
+        WAIT_TIMEOUT,
+    };
+
+    #[pyattr]
+    const NULL: isize = 0;
+
+    #[pyattr]
+    const INVALID_HANDLE_VALUE: isize = host_overlapped::INVALID_HANDLE_VALUE_ISIZE;
+
+    #[derive(FromArgs)]
+    struct DuplicateOptions {
+        #[pyarg(positional, default)]
+        options: u32,
+    }
+
+    #[derive(FromArgs)]
+    struct WaitTimeout {
+        #[pyarg(positional, default = host_winapi::INFINITE_TIMEOUT)]
+        milliseconds: u32,
+    }
+
+    #[derive(FromArgs)]
+    struct PeekSize {
+        #[pyarg(positional, default)]
+        size: i32,
+    }
+
+    #[pyattr]
+    const INFINITE: u32 = host_winapi::INFINITE_TIMEOUT;
+
+    #[pyfunction]
+    fn CloseHandle(handle: PyObjectRef, vm: &VirtualMachine) -> PyResult {
+        let value = WinHandle::from_bitfield(&handle, vm, "CloseHandle", "argument")?;
+        WindowsSysResult(host_winapi::close_handle(value.0)).into_pyresult(vm)?;
+        Ok(vm.ctx.none())
+    }
+
+    #[pyfunction]
+    fn RegisterEventSource(
+        unc_server_name: Option<PyStrRef>,
+        source_name: PyStrRef,
+        vm: &VirtualMachine,
+    ) -> PyResult<WinHandle> {
+        let unc_server_name = unc_server_name
+            .map(|unc_server_name| unc_server_name.as_wtf8().to_wide_cstring())
+            .transpose()
+            .map_err(|_| nul_char_error(vm))?;
+        let source_name = source_name
+            .as_wtf8()
+            .to_wide_cstring()
+            .map_err(|_| nul_char_error(vm))?;
+        vm.allow_threads(|| {
+            host_winapi::register_event_source_w(unc_server_name.as_deref(), &source_name)
+        })
+        .map(WinHandle)
+        .map_err(|error| error.to_pyexception(vm))
+    }
+
+    #[pyfunction]
+    fn DeregisterEventSource(handle: PyObjectRef, vm: &VirtualMachine) -> PyResult {
+        let value = WinHandle::from_bitfield(&handle, vm, "DeregisterEventSource", "argument")?;
+        vm.allow_threads(|| host_winapi::deregister_event_source(value.0))
+            .map_err(|error| error.to_pyexception(vm))?;
+        Ok(vm.ctx.none())
+    }
+
+    #[pyfunction]
+    fn ReportEvent(
+        handle: WinHandle,
+        r#type: u16,
+        category: u16,
+        event_id: u32,
+        string: PyStrRef,
+        vm: &VirtualMachine,
+    ) -> PyResult<()> {
+        let string = string
+            .as_wtf8()
+            .to_wide_cstring()
+            .map_err(|_| nul_char_error(vm))?;
+        vm.allow_threads(|| {
+            host_winapi::report_event_w(handle.0, r#type, category, event_id, &string)
+        })
+        .map_err(|error| error.to_pyexception(vm))
+    }
+
+    /// CreateFile - Create or open a file or I/O device.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "matches Win32 CreateFile parameter structure"
+    )]
+    #[pyfunction]
+    fn CreateFile(
+        file_name: ArgWideString,
+        desired_access: u32,
+        share_mode: u32,
+        _security_attributes: PyObjectRef, // Always NULL (0)
+        creation_disposition: u32,
+        flags_and_attributes: u32,
+        _template_file: PyObjectRef, // Always NULL (0)
+        vm: &VirtualMachine,
+    ) -> PyResult<WinHandle> {
+        let file_name_wide = &file_name.wide;
+        vm.audit("_winapi.CreateFile", || {
+            (
+                audit_wide(Some(file_name_wide), vm),
+                desired_access,
+                share_mode,
+                creation_disposition,
+                flags_and_attributes,
+            )
+        })?;
+        host_winapi::create_file_w(
+            file_name_wide,
+            desired_access,
+            share_mode,
+            creation_disposition,
+            flags_and_attributes,
+        )
+        .map(WinHandle)
+        .map_err(|e| e.to_pyexception(vm))
+    }
+
+    #[pyfunction]
+    fn GetStdHandle(std_handle: PyObjectRef, vm: &VirtualMachine) -> PyResult {
+        let value = WinHandle::unsigned_long_bitfield(&std_handle, vm, "GetStdHandle", "argument")?;
+        let handle = host_winapi::get_std_handle(value)
+            .map(|handle| handle.map(WinHandle))
+            .map_err(|e| e.to_pyexception(vm))?;
+        Ok(handle.to_pyobject(vm))
+    }
+
+    #[pyfunction]
+    fn CreatePipe(
+        _pipe_attrs: PyObjectRef,
+        size: u32,
+        vm: &VirtualMachine,
+    ) -> PyResult<(WinHandle, WinHandle)> {
+        vm.audit("_winapi.CreatePipe", || ())?;
+        host_winapi::create_pipe(size)
+            .map(|(read, write)| (WinHandle(read), WinHandle(write)))
+            .map_err(|e| e.to_pyexception(vm))
+    }
+
+    #[pyfunction]
+    fn DuplicateHandle(
+        source_process_handle: WinHandle,
+        source_handle: WinHandle,
+        target_process_handle: WinHandle,
+        desired_access: u32,
+        inherit_handle: i32,
+        DuplicateOptions { options }: DuplicateOptions,
+        vm: &VirtualMachine,
+    ) -> PyResult<WinHandle> {
+        host_winapi::duplicate_handle(
+            source_process_handle.0,
+            source_handle.0,
+            target_process_handle.0,
+            desired_access,
+            inherit_handle,
+            options,
+        )
+        .map(WinHandle)
+        .map_err(|e| e.to_pyexception(vm))
+    }
+
+    #[pyfunction]
+    fn GetACP() -> u32 {
+        host_winapi::get_acp()
+    }
+
+    #[pyfunction]
+    fn GetCurrentProcess() -> WinHandle {
+        WinHandle(host_winapi::get_current_process())
+    }
+
+    #[pyfunction]
+    fn GetFileType(h: WinHandle, vm: &VirtualMachine) -> PyResult<host_winapi::FileType> {
+        host_winapi::get_file_type(h.0).map_err(|e| e.to_pyexception(vm))
+    }
+
+    #[pyfunction]
+    fn GetLastError() -> u32 {
+        host_winapi::get_last_error()
+    }
+
+    #[pyfunction]
+    fn GetVersion() -> u32 {
+        host_winapi::get_version()
+    }
+
+    #[derive(FromArgs)]
+    struct CreateProcessArgs {
+        #[pyarg(positional)]
+        application_name: Option<ArgWideString>,
+        #[pyarg(positional)]
+        command_line: PyObjectRef,
+        #[pyarg(positional)]
+        #[allow(dead_code)]
+        proc_attrs: PyObjectRef,
+        #[pyarg(positional)]
+        #[allow(dead_code)]
+        thread_attrs: PyObjectRef,
+        #[pyarg(positional)]
+        inherit_handles: i32,
+        #[pyarg(positional)]
+        creation_flags: u32,
+        #[pyarg(positional)]
+        env_mapping: PyObjectRef,
+        #[pyarg(positional)]
+        current_directory: Option<ArgWideString>,
+        #[pyarg(positional)]
+        startup_info: PyObjectRef,
+    }
+
+    #[pyfunction]
+    fn CreateProcess(
+        args: CreateProcessArgs,
+        vm: &VirtualMachine,
+    ) -> PyResult<(WinHandle, WinHandle, u32, u32)> {
+        let app_name = args
+            .application_name
+            .as_ref()
+            .map(|name| name.wide.as_ucstr());
+        let current_dir = args
+            .current_directory
+            .as_ref()
+            .map(|name| name.wide.as_ucstr());
+        vm.audit("_winapi.CreateProcess", || {
+            (
+                audit_wide(app_name, vm),
+                args.command_line.clone(),
+                audit_wide(current_dir, vm),
+            )
+        })?;
+
+        // Default failed startup attribute lookups as CPython does. Keep value
+        // conversion errors separate from lookup failures.
+        macro_rules! si_attr {
+            ($attr:ident, $t:ty) => {{
+                args.startup_info
+                    .get_attr(stringify!($attr), vm)
+                    .ok()
+                    .map(|obj| <Option<$t>>::try_from_object(vm, obj))
+                    .transpose()?
+                    .flatten()
+                    .unwrap_or(0) as _
+            }};
+            ($attr:ident) => {{
+                args.startup_info
+                    .get_attr(stringify!($attr), vm)
+                    .ok()
+                    .map(|obj| TryFromObject::try_from_object(vm, obj))
+                    .transpose()?
+                    .unwrap_or(0)
+            }};
+        }
+        let startup_info = host_winapi::StartupInfoData {
+            flags: si_attr!(dwFlags),
+            show_window: si_attr!(wShowWindow),
+            std_input: si_attr!(hStdInput, isize),
+            std_output: si_attr!(hStdOutput, isize),
+            std_error: si_attr!(hStdError, isize),
+        };
+
+        let env_mapping = if vm.is_none(&args.env_mapping) {
+            None
+        } else {
+            Some(ArgMapping::try_from_object(vm, args.env_mapping)?)
+        };
+        let env = env_mapping
+            .as_ref()
+            .map(|mapping| getenvironment(mapping, vm))
+            .transpose()?;
+
+        let handle_list = args
+            .startup_info
+            .get_attr("lpAttributeList", vm)
+            .ok()
+            .map(|obj| get_handle_list(obj, vm))
+            .transpose()?
+            .flatten();
+
+        let mut command_line = if vm.is_none(&args.command_line) {
+            None
+        } else {
+            let line = args
+                .command_line
+                .downcast_ref::<crate::builtins::PyStr>()
+                .ok_or_else(|| {
+                    vm.new_type_error(format!(
+                        "CreateProcess() argument 2 must be str or None, not {}",
+                        args.command_line.class().name()
+                    ))
+                })?;
+            Some(
+                line.as_wtf8()
+                    .to_wide_cstring()
+                    .map_err(|_| nul_char_error(vm))?
+                    .into_vec_with_nul(),
+            )
+        };
+
+        let procinfo = host_winapi::create_process(
+            app_name,
+            command_line.as_deref_mut(),
+            args.inherit_handles,
+            args.creation_flags,
+            env.as_deref(),
+            current_dir,
+            startup_info,
+            handle_list,
+        )
+        .map_err(|e| e.to_pyexception(vm))?;
+
+        Ok((
+            WinHandle(procinfo.process),
+            WinHandle(procinfo.thread),
+            procinfo.process_id,
+            procinfo.thread_id,
+        ))
+    }
+
+    #[pyfunction]
+    fn OpenProcess(
+        desired_access: u32,
+        inherit_handle: i32,
+        process_id: u32,
+        vm: &VirtualMachine,
+    ) -> PyResult<WinHandle> {
+        vm.audit("_winapi.OpenProcess", || (process_id, desired_access))?;
+        host_winapi::open_process(desired_access, inherit_handle != 0, process_id)
+            .map(WinHandle)
+            .map_err(|e| e.to_pyexception(vm))
+    }
+
+    #[pyfunction]
+    fn ExitProcess(ExitCode: u32) {
+        host_winapi::exit_process(ExitCode)
+    }
+
+    #[pyfunction]
+    fn NeedCurrentDirectoryForExePath(exe_name: PyStrRef, vm: &VirtualMachine) -> PyResult<bool> {
+        exe_name
+            .as_wtf8()
+            .to_wide_cstring()
+            .map(|exe_name| host_winapi::need_current_directory_for_exe_path_w(&exe_name))
+            .map_err(|_| nul_char_error(vm))
+    }
+
+    #[pyfunction]
+    fn CreateJunction(
+        src_path: ArgWideString,
+        dst_path: ArgWideString,
+        vm: &VirtualMachine,
+    ) -> PyResult<()> {
+        use std::os::windows::ffi::OsStringExt;
+        let src_wide = &src_path.wide;
+        let dst_wide = &dst_path.wide;
+        if src_wide.as_slice().starts_with(&[92, 63, 63, 92]) {
+            return Err(std::io::Error::from_raw_os_error(87).to_pyexception(vm));
+        }
+        vm.audit("_winapi.CreateJunction", || {
+            (
+                audit_wide(Some(src_wide), vm),
+                audit_wide(Some(dst_wide), vm),
+            )
+        })?;
+        let src = std::path::PathBuf::from(std::ffi::OsString::from_wide(src_wide.as_slice()));
+        let dst = std::path::PathBuf::from(std::ffi::OsString::from_wide(dst_wide.as_slice()));
+        host_winapi::create_junction(&src, &dst).map_err(|e| e.to_pyexception(vm))
+    }
+
+    fn getenvironment(env: &ArgMapping, vm: &VirtualMachine) -> PyResult<Vec<u16>> {
+        let keys = env.mapping().keys(vm)?;
+        let values = env.mapping().values(vm)?;
+
+        let keys = ArgSequence::try_from_object(vm, keys)?.into_vec();
+        let values = ArgSequence::try_from_object(vm, values)?.into_vec();
+
+        if keys.len() != values.len() {
+            return Err(vm.new_runtime_error("environment changed size during iteration"));
+        }
+
+        let mut entries = Vec::with_capacity(keys.len());
+        for (k, v) in keys.into_iter().zip(values) {
+            let k = PyStrRef::try_from_object(vm, k)?;
+            let k = k.as_wtf8().encode_wide().collect();
+            let v = PyStrRef::try_from_object(vm, v)?;
+            let v = v.as_wtf8().encode_wide().collect();
+            entries.push((k, v));
+        }
+
+        host_winapi::build_environment_block(entries).map_err(|err| err.to_pyexception(vm))
+    }
+
+    fn get_handle_list(obj: PyObjectRef, vm: &VirtualMachine) -> PyResult<Option<Vec<usize>>> {
+        let Some(mapping) = <Option<ArgMapping>>::try_from_object(vm, obj)? else {
+            return Ok(None);
+        };
+        mapping
+            .as_ref()
+            .get_item("handle_list", vm)
+            .ok()
+            .and_then(|obj| {
+                <Option<ArgSequence<usize>>>::try_from_object(vm, obj)
+                    .map(|s| match s {
+                        Some(s) if !s.is_empty() => Some(s.into_vec()),
+                        _ => None,
+                    })
+                    .transpose()
+            })
+            .transpose()
+    }
+
+    #[pyfunction]
+    fn WaitForSingleObject(
+        handle: WinHandle,
+        milliseconds: PyObjectRef,
+        vm: &VirtualMachine,
+    ) -> PyResult<u32> {
+        let Some(index) = milliseconds.try_index_opt(vm) else {
+            let actual = if vm.is_none(&milliseconds) {
+                "None".to_owned()
+            } else {
+                let name = milliseconds.class().slot_name();
+                name[..name.floor_char_boundary(50.min(name.len()))].to_owned()
+            };
+            return Err(vm.new_type_error(format!(
+                "WaitForSingleObject() argument 2 must be int, not {actual}"
+            )));
+        };
+        let index = index?;
+        let fits = index
+            .as_bigint()
+            .to_i64()
+            .is_some_and(|value| (i32::MIN as i64..=u32::MAX as i64).contains(&value));
+        if !fits {
+            crate::stdlib::_warnings::warn(
+                vm.ctx.exceptions.deprecation_warning,
+                "integer value out of range".to_owned(),
+                1,
+                vm,
+            )?;
+        }
+        let milliseconds = index.as_u32_mask();
+        vm.allow_threads(|| host_winapi::wait_for_single_object(handle.0, milliseconds))
+            .map_err(|e| e.to_pyexception(vm))
+    }
+
+    #[pyfunction]
+    fn WaitForMultipleObjects(
+        handle_seq: ArgSequence<isize>,
+        wait_flag: bool,
+        WaitTimeout { milliseconds }: WaitTimeout,
+        vm: &VirtualMachine,
+    ) -> PyResult<u32> {
+        let handles: Vec<host_winapi::Handle> = handle_seq
+            .into_vec()
+            .into_iter()
+            .map(|h| h as host_winapi::Handle)
+            .collect();
+
+        if handles.is_empty() {
+            return Err(vm.new_value_error("handle_seq must not be empty"));
+        }
+
+        if handles.len() > 64 {
+            return Err(vm.new_value_error("WaitForMultipleObjects supports at most 64 handles"));
+        }
+
+        vm.allow_threads(|| {
+            host_winapi::wait_for_multiple_objects(&handles, wait_flag, milliseconds)
+        })
+        .map_err(|e| e.to_pyexception(vm))
+    }
+
+    #[pyfunction]
+    fn GetExitCodeProcess(process: PyObjectRef, vm: &VirtualMachine) -> PyResult {
+        let value = WinHandle::from_bitfield(&process, vm, "GetExitCodeProcess", "argument")?;
+        let code = host_winapi::get_exit_code_process(value.0).map_err(|e| e.to_pyexception(vm))?;
+        Ok(vm.ctx.new_int(code).into())
+    }
+
+    #[pyfunction]
+    fn TerminateProcess(handle: WinHandle, exit_code: u32, vm: &VirtualMachine) -> PyResult<()> {
+        vm.audit("_winapi.TerminateProcess", || {
+            (handle.0 as isize, exit_code)
+        })?;
+        WindowsSysResult(host_winapi::terminate_process(handle.0, exit_code)).into_pyresult(vm)?;
+        Ok(())
+    }
+
+    #[derive(FromArgs)]
+    struct OptionalJobName {
+        #[pyarg(positional, optional)]
+        name: Option<PyStrRef>,
+    }
+
+    #[pyfunction]
+    fn CreateJobObject(
+        _security_attributes: PyObjectRef,
+        name: OptionalJobName,
+        vm: &VirtualMachine,
+    ) -> PyResult<WinHandle> {
+        let name = name
+            .name
+            .map(|name| name.as_wtf8().to_wide_cstring())
+            .transpose()
+            .map_err(|_| nul_char_error(vm))?;
+        host_winapi::create_job_object_w(name.as_deref())
+            .map(WinHandle)
+            .map_err(|e| e.to_pyexception(vm))
+    }
+
+    #[pyfunction]
+    fn AssignProcessToJobObject(
+        job: WinHandle,
+        process: WinHandle,
+        vm: &VirtualMachine,
+    ) -> PyResult<()> {
+        host_winapi::assign_process_to_job_object(job.0, process.0)
+            .map_err(|e| e.to_pyexception(vm))
+    }
+
+    #[pyfunction]
+    fn TerminateJobObject(job: WinHandle, exit_code: u32, vm: &VirtualMachine) -> PyResult<()> {
+        host_winapi::terminate_job_object(job.0, exit_code).map_err(|e| e.to_pyexception(vm))
+    }
+
+    #[pyfunction]
+    fn SetJobObjectKillOnClose(job: WinHandle, vm: &VirtualMachine) -> PyResult<()> {
+        host_winapi::set_job_object_kill_on_close(job.0).map_err(|e| e.to_pyexception(vm))
+    }
+
+    #[pyfunction]
+    fn GetModuleFileName(module_handle: PyObjectRef, vm: &VirtualMachine) -> PyResult {
+        let value = WinHandle::from_bitfield(&module_handle, vm, "GetModuleFileName", "argument")?;
+        let mut path: Vec<u16> = vec![0; host_winapi::MAX_PATH_USIZE];
+
+        let length = host_winapi::get_module_file_name(value.0, &mut path);
+        if length == 0 {
+            return Err(vm.new_runtime_error("GetModuleFileName failed"));
+        }
+
+        let (path, _) = path.split_at(length as usize);
+        Ok(vm.ctx.new_str(String::from_utf16(path).unwrap()).into())
+    }
+
+    #[derive(FromArgs)]
+    #[from_args(legacy, fname = "OpenMutexW")]
+    struct OpenMutexWArgs {
+        #[pyarg(any)]
+        desired_access: u32,
+        #[pyarg(any)]
+        inherit_handle: i32,
+        #[pyarg(any)]
+        name: ArgWideString,
+    }
+
+    #[pyfunction]
+    fn OpenMutexW(args: OpenMutexWArgs, vm: &VirtualMachine) -> PyResult<WinHandle> {
+        let name = &args.name.wide;
+        vm.audit("_winapi.OpenMutexW", || {
+            (args.desired_access, audit_wide(Some(name), vm))
+        })?;
+        host_winapi::open_mutex_w(args.desired_access, args.inherit_handle != 0, name)
+            .map(WinHandle)
+            .map_err(|e| e.to_pyexception(vm))
+    }
+
+    #[pyfunction]
+    fn ReleaseMutex(handle: WinHandle) -> WindowsSysResult<i32> {
+        WindowsSysResult(host_winapi::release_mutex(handle.0))
+    }
+
+    #[pyattr]
+    use host_winapi::{LOCALE_NAME_INVARIANT, LOCALE_NAME_SYSTEM_DEFAULT};
+
+    #[pyattr(name = "LOCALE_NAME_USER_DEFAULT")]
+    fn locale_name_user_default(vm: &VirtualMachine) -> PyObjectRef {
+        vm.ctx.none()
+    }
+
+    // LCMapStringEx - Map a string to another string using locale-specific rules
+    // This is used by ntpath.normcase() for proper Windows case conversion
+    #[derive(FromArgs)]
+    #[from_args(legacy, fname = "LCMapStringEx")]
+    struct LCMapStringExArgs {
+        #[pyarg(any)]
+        locale: PyStrRef,
+        #[pyarg(any)]
+        flags: u32,
+        #[pyarg(any)]
+        src: PyStrRef,
+    }
+
+    #[pyfunction]
+    fn LCMapStringEx(args: LCMapStringExArgs, vm: &VirtualMachine) -> PyResult<PyStrRef> {
+        let locale = args.locale;
+        let flags = args.flags;
+        let src = args.src;
+        // Reject unsupported flags
+        if flags
+            & (host_winapi::LCMAP_SORTHANDLE_FLAG
+                | host_winapi::LCMAP_HASH_FLAG
+                | host_winapi::LCMAP_BYTEREV_FLAG
+                | host_winapi::LCMAP_SORTKEY_FLAG)
+            != 0
+        {
+            return Err(vm.new_value_error("unsupported flags"));
+        }
+
+        // Use ToWideString which properly handles WTF-8 (including surrogates)
+        let locale_wide = locale
+            .as_wtf8()
+            .to_wide_cstring()
+            .map_err(|_| nul_char_error(vm))?;
+        // SAFETY: Interior NULs and non-NUL capped strings are fine here because the API takes
+        // in a length.
+        let src_wide: Vec<_> = src.as_wtf8().encode_wide().collect();
+
+        if src_wide.len() > i32::MAX as usize {
+            return Err(vm.new_overflow_error("input string is too long"));
+        }
+
+        let dest = host_winapi::lc_map_string_ex(&locale_wide, flags, &src_wide)
+            .map_err(|e| e.to_pyexception(vm))?;
+
+        // Convert UTF-16 back to WTF-8 (handles surrogates properly)
+        let result = Wtf8Buf::from_wide(&dest);
+        Ok(vm.ctx.new_str(result))
+    }
+
+    #[derive(FromArgs)]
+    struct CreateNamedPipeArgs {
+        #[pyarg(positional)]
+        name: ArgWideString,
+        #[pyarg(positional)]
+        open_mode: u32,
+        #[pyarg(positional)]
+        pipe_mode: u32,
+        #[pyarg(positional)]
+        max_instances: u32,
+        #[pyarg(positional)]
+        out_buffer_size: u32,
+        #[pyarg(positional)]
+        in_buffer_size: u32,
+        #[pyarg(positional)]
+        default_timeout: u32,
+        #[pyarg(positional)]
+        #[allow(dead_code)]
+        security_attributes: PyObjectRef, // Ignored, can be None
+    }
+
+    // CreateNamedPipe - Create a named pipe
+    #[pyfunction]
+    fn CreateNamedPipe(args: CreateNamedPipeArgs, vm: &VirtualMachine) -> PyResult<WinHandle> {
+        let name = &args.name.wide;
+        vm.audit("_winapi.CreateNamedPipe", || {
+            (audit_wide(Some(name), vm), args.open_mode, args.pipe_mode)
+        })?;
+        host_winapi::create_named_pipe_w(
+            name,
+            args.open_mode,
+            args.pipe_mode,
+            args.max_instances,
+            args.out_buffer_size,
+            args.in_buffer_size,
+            args.default_timeout,
+        )
+        .map(WinHandle)
+        .map_err(|e| e.to_pyexception(vm))
+    }
+
+    // ==================== Overlapped class ====================
+    // Used for asynchronous I/O operations (ConnectNamedPipe, ReadFile, WriteFile)
+
+    #[pyattr]
+    #[pyclass(name = "Overlapped", module = "_winapi")]
+    #[derive(Debug, PyPayload)]
+    struct Overlapped {
+        inner: PyMutex<host_overlapped::Operation>,
+    }
+
+    impl Overlapped {
+        fn new_with_handle(handle: host_winapi::Handle, vm: &VirtualMachine) -> PyResult<Self> {
+            host_overlapped::Operation::new(handle)
+                .map(|inner| Self {
+                    inner: PyMutex::new(inner),
+                })
+                .map_err(|e| e.to_pyexception(vm))
+        }
+
+        /// Take `inner`, detaching while blocked.
+        ///
+        /// `GetOverlappedResult` holds this mutex across its `allow_threads`
+        /// wait, so a stopped thread can still be holding it. Blocking on it
+        /// while attached would leave no safepoint for that stop to complete at.
+        fn lock_inner(&self, vm: &VirtualMachine) -> PyMutexGuard<'_, host_overlapped::Operation> {
+            vm.allow_threads(|| self.inner.lock())
+        }
+    }
+
+    #[pyclass(with(Constructor))]
+    impl Py<Overlapped> {
+        #[pymethod]
+        fn GetOverlappedResult(&self, wait: bool, vm: &VirtualMachine) -> PyResult<(u32, u32)> {
+            let mut inner = self.lock_inner(vm);
+            vm.allow_threads(|| inner.get_result(wait))
+                .map(|result| (result.transferred, result.error))
+                .map_err(|e| e.to_pyexception(vm))
+        }
+
+        #[pymethod]
+        fn getbuffer(&self, vm: &VirtualMachine) -> PyResult<Option<PyObjectRef>> {
+            let inner = self.lock_inner(vm);
+            if !inner.is_completed() {
+                return Err(vm.new_value_error(
+                    "can't get read buffer before GetOverlappedResult() signals the operation completed",
+                ));
+            }
+            Ok(inner
+                .read_buffer()
+                .map(|buf| vm.ctx.new_bytes(buf.to_vec()).into()))
+        }
+
+        #[pymethod]
+        fn cancel(&self, vm: &VirtualMachine) -> PyResult<()> {
+            let mut inner = self.lock_inner(vm);
+            inner.cancel().map_err(|e| e.to_pyexception(vm))
+        }
+
+        #[pygetset]
+        fn event(&self, vm: &VirtualMachine) -> isize {
+            let inner = self.lock_inner(vm);
+            inner.event() as isize
+        }
+    }
+
+    impl Constructor for Overlapped {
+        type Args = ();
+
+        fn py_new(
+            _cls: &Py<crate::builtins::PyType>,
+            _args: Self::Args,
+            vm: &VirtualMachine,
+        ) -> PyResult<Self> {
+            Self::new_with_handle(null_mut(), vm)
+        }
+    }
+
+    /// ConnectNamedPipe - Wait for a client to connect to a named pipe
+    #[derive(FromArgs)]
+    struct ConnectNamedPipeArgs {
+        #[pyarg(any)]
+        handle: WinHandle,
+        #[pyarg(any, default)]
+        overlapped: bool,
+    }
+
+    #[pyfunction]
+    fn ConnectNamedPipe(args: ConnectNamedPipeArgs, vm: &VirtualMachine) -> PyResult<PyObjectRef> {
+        let handle = args.handle;
+        let use_overlapped = args.overlapped;
+
+        if use_overlapped {
+            let ov = Overlapped::new_with_handle(handle.0, vm)?;
+            {
+                let mut inner = ov.inner.lock();
+                inner
+                    .connect_named_pipe()
+                    .map_err(|e| e.to_pyexception(vm))?;
+            }
+            Ok(ov.into_pyobject(vm))
+        } else {
+            vm.allow_threads(|| host_winapi::connect_named_pipe(handle.0))
+                .map_err(|e| e.to_pyexception(vm))?;
+            Ok(vm.ctx.none())
+        }
+    }
+
+    /// Helper for GetShortPathName and GetLongPathName
+    fn path_name_result_to_pystr(wide: Vec<u16>, vm: &VirtualMachine) -> PyStrRef {
+        // Convert UTF-16 back to WTF-8 (handles surrogates properly)
+        let result_str = Wtf8Buf::from_wide(&wide);
+        vm.ctx.new_str(result_str)
+    }
+
+    #[derive(FromArgs)]
+    struct PathNameArgs {
+        #[pyarg(any)]
+        path: PyStrRef,
+    }
+
+    #[pyfunction]
+    fn GetShortPathName(args: PathNameArgs, vm: &VirtualMachine) -> PyResult<PyStrRef> {
+        let path = args.path;
+        let path = path
+            .as_wtf8()
+            .to_wide_cstring()
+            .map_err(|_| nul_char_error(vm))?;
+        let wide = host_winapi::get_short_path_name_w(&path).map_err(|e| e.to_pyexception(vm))?;
+        Ok(path_name_result_to_pystr(wide, vm))
+    }
+
+    #[pyfunction]
+    fn GetLongPathName(args: PathNameArgs, vm: &VirtualMachine) -> PyResult<PyStrRef> {
+        let path = args.path;
+        let path = path
+            .as_wtf8()
+            .to_wide_cstring()
+            .map_err(|_| nul_char_error(vm))?;
+        let wide = host_winapi::get_long_path_name_w(&path).map_err(|e| e.to_pyexception(vm))?;
+        Ok(path_name_result_to_pystr(wide, vm))
+    }
+
+    // WaitNamedPipe - Wait for an instance of a named pipe to become available.
+    #[pyfunction]
+    fn WaitNamedPipe(name: PyStrRef, timeout: u32, vm: &VirtualMachine) -> PyResult<()> {
+        let name = name
+            .as_wtf8()
+            .to_wide_cstring()
+            .map_err(|_| nul_char_error(vm))?;
+        host_winapi::wait_named_pipe_w(&name, timeout).map_err(|e| e.to_pyexception(vm))
+    }
+
+    // PeekNamedPipe - Peek at data in a named pipe without removing it.
+    #[pyfunction]
+    fn PeekNamedPipe(
+        handle: WinHandle,
+        PeekSize { size }: PeekSize,
+        vm: &VirtualMachine,
+    ) -> PyResult<PyObjectRef> {
+        if size < 0 {
+            return Err(vm.new_value_error("negative size"));
+        }
+
+        if size > 0 {
+            let result = host_winapi::peek_named_pipe(handle.0, Some(size as u32))
+                .map_err(|e| e.to_pyexception(vm))?;
+            let mut buf = result.data.unwrap_or_default();
+            buf.shrink_to_fit();
+            let bytes: PyObjectRef = vm.ctx.new_bytes(buf).into();
+            Ok(vm
+                .ctx
+                .new_tuple(vec![
+                    bytes,
+                    vm.ctx.new_int(result.available).into(),
+                    vm.ctx.new_int(result.left_this_message).into(),
+                ])
+                .into())
+        } else {
+            let result =
+                host_winapi::peek_named_pipe(handle.0, None).map_err(|e| e.to_pyexception(vm))?;
+            Ok(vm
+                .ctx
+                .new_tuple(vec![
+                    vm.ctx.new_int(result.available).into(),
+                    vm.ctx.new_int(result.left_this_message).into(),
+                ])
+                .into())
+        }
+    }
+
+    // CreateEventW - Create or open a named or unnamed event object.
+    #[derive(FromArgs)]
+    #[from_args(legacy, fname = "CreateEventW")]
+    struct CreateEventWArgs {
+        #[pyarg(any)]
+        security_attributes: isize,
+        #[pyarg(any)]
+        manual_reset: i32,
+        #[pyarg(any)]
+        initial_state: i32,
+        #[pyarg(any)]
+        name: Option<ArgWideString>,
+    }
+
+    #[pyfunction]
+    fn CreateEventW(args: CreateEventWArgs, vm: &VirtualMachine) -> PyResult<WinHandle> {
+        let _ = args.security_attributes;
+        let name = args.name.as_ref().map(|name| name.wide.as_ucstr());
+        vm.audit("_winapi.CreateEventW", || {
+            (args.manual_reset, args.initial_state, audit_wide(name, vm))
+        })?;
+        host_winapi::create_event_w(args.manual_reset != 0, args.initial_state != 0, name)
+            .map(WinHandle)
+            .map_err(|e| e.to_pyexception(vm))
+    }
+
+    // SetEvent - Set the specified event object to the signaled state.
+    #[pyfunction]
+    fn SetEvent(event: WinHandle, vm: &VirtualMachine) -> PyResult<()> {
+        host_winapi::set_event(event.0).map_err(|e| e.to_pyexception(vm))
+    }
+
+    #[derive(FromArgs)]
+    #[from_args(legacy, fname = "WriteFile")]
+    struct WriteFileArgs {
+        #[pyarg(any)]
+        handle: WinHandle,
+        #[pyarg(any)]
+        buffer: ArgBytesLike,
+        #[pyarg(any, default)]
+        overlapped: bool,
+    }
+
+    // WriteFile - Write data to a file or I/O device.
+    #[pyfunction]
+    fn WriteFile(args: WriteFileArgs, vm: &VirtualMachine) -> PyResult<PyObjectRef> {
+        let handle = args.handle;
+        let use_overlapped = args.overlapped;
+        let buf = args.buffer.borrow_buf();
+
+        if use_overlapped {
+            let ov = Overlapped::new_with_handle(handle.0, vm)?;
+            let err = {
+                let mut inner = ov.inner.lock();
+                inner.write(&buf).map_err(|e| e.to_pyexception(vm))?
+            };
+
+            let result = vm
+                .ctx
+                .new_tuple(vec![ov.into_pyobject(vm), vm.ctx.new_int(err).into()]);
+            return Ok(result.into());
+        }
+
+        let result = host_winapi::write_file(handle.0, &buf).map_err(|e| e.to_pyexception(vm))?;
+        Ok(vm
+            .ctx
+            .new_tuple(vec![
+                vm.ctx.new_int(result.written).into(),
+                vm.ctx.new_int(result.error).into(),
+            ])
+            .into())
+    }
+
+    #[derive(FromArgs)]
+    #[from_args(legacy, fname = "ReadFile")]
+    struct ReadFileArgs {
+        #[pyarg(any)]
+        handle: WinHandle,
+        #[pyarg(any)]
+        size: u32,
+        #[pyarg(any, default)]
+        overlapped: bool,
+    }
+
+    // ReadFile - Read data from a file or I/O device.
+    #[pyfunction]
+    fn ReadFile(args: ReadFileArgs, vm: &VirtualMachine) -> PyResult<PyObjectRef> {
+        let handle = args.handle;
+        let size = args.size;
+        let use_overlapped = args.overlapped;
+
+        if use_overlapped {
+            let ov = Overlapped::new_with_handle(handle.0, vm)?;
+            let err = {
+                let mut inner = ov.inner.lock();
+                inner.read(size).map_err(|e| e.to_pyexception(vm))?
+            };
+            let result = vm
+                .ctx
+                .new_tuple(vec![ov.into_pyobject(vm), vm.ctx.new_int(err).into()]);
+            return Ok(result.into());
+        }
+
+        let mut result = vm
+            .allow_threads(|| host_winapi::read_file(handle.0, size))
+            .map_err(|e| e.to_pyexception(vm))?;
+        result.data.shrink_to_fit();
+        Ok(vm
+            .ctx
+            .new_tuple(vec![
+                vm.ctx.new_bytes(result.data).into(),
+                vm.ctx.new_int(result.error).into(),
+            ])
+            .into())
+    }
+
+    // SetNamedPipeHandleState - Set the read mode and other options of a named pipe.
+    #[pyfunction]
+    fn SetNamedPipeHandleState(
+        named_pipe: WinHandle,
+        mode: PyObjectRef,
+        max_collection_count: PyObjectRef,
+        collect_data_timeout: PyObjectRef,
+        vm: &VirtualMachine,
+    ) -> PyResult<()> {
+        let objs = [&mode, &max_collection_count, &collect_data_timeout];
+        let mut values = [None; 3];
+        for (index, obj) in objs.iter().enumerate() {
+            if !vm.is_none(obj) {
+                values[index] = Some(u32::try_from_object(vm, (*obj).clone())?);
+            }
+        }
+        host_winapi::set_named_pipe_handle_state(named_pipe.0, values[0], values[1], values[2])
+            .map_err(|e| e.to_pyexception(vm))
+    }
+
+    // ResetEvent - Reset the specified event object to the nonsignaled state.
+    #[pyfunction]
+    fn ResetEvent(event: WinHandle, vm: &VirtualMachine) -> PyResult<()> {
+        host_winapi::reset_event(event.0).map_err(|e| e.to_pyexception(vm))
+    }
+
+    // CreateMutexW - Create or open a named or unnamed mutex object.
+    #[derive(FromArgs)]
+    #[from_args(legacy, fname = "CreateMutexW")]
+    struct CreateMutexWArgs {
+        #[pyarg(any)]
+        security_attributes: isize,
+        #[pyarg(any)]
+        initial_owner: i32,
+        #[pyarg(any)]
+        name: Option<ArgWideString>,
+    }
+
+    #[pyfunction]
+    fn CreateMutexW(args: CreateMutexWArgs, vm: &VirtualMachine) -> PyResult<WinHandle> {
+        let _ = args.security_attributes;
+        let name = args.name.as_ref().map(|name| name.wide.as_ucstr());
+        vm.audit("_winapi.CreateMutexW", || {
+            (args.initial_owner, audit_wide(name, vm))
+        })?;
+        host_winapi::create_mutex_w(args.initial_owner != 0, name)
+            .map(WinHandle)
+            .map_err(|e| e.to_pyexception(vm))
+    }
+
+    // OpenEventW - Open an existing named event object.
+    #[derive(FromArgs)]
+    #[from_args(legacy, fname = "OpenEventW")]
+    struct OpenEventWArgs {
+        #[pyarg(any)]
+        desired_access: u32,
+        #[pyarg(any)]
+        inherit_handle: i32,
+        #[pyarg(any)]
+        name: ArgWideString,
+    }
+
+    #[pyfunction]
+    fn OpenEventW(args: OpenEventWArgs, vm: &VirtualMachine) -> PyResult<WinHandle> {
+        let name = &args.name.wide;
+        vm.audit("_winapi.OpenEventW", || {
+            (args.desired_access, audit_wide(Some(name), vm))
+        })?;
+        host_winapi::open_event_w(args.desired_access, args.inherit_handle != 0, name)
+            .map(WinHandle)
+            .map_err(|e| e.to_pyexception(vm))
+    }
+
+    const MAXIMUM_WAIT_OBJECTS: usize = host_winapi::MAXIMUM_WAIT_OBJECTS as usize;
+
+    #[pyfunction]
+    fn BatchedWaitForMultipleObjects(
+        handle_seq: PyObjectRef,
+        wait_all: bool,
+        milliseconds: OptionalArg<u32>,
+        vm: &VirtualMachine,
+    ) -> PyResult<PyObjectRef> {
+        let milliseconds = milliseconds.unwrap_or(host_winapi::INFINITE_TIMEOUT);
+
+        // Get handles from sequence
+        let seq = ArgSequence::<isize>::try_from_object(vm, handle_seq)?;
+        let handles: Vec<host_winapi::Handle> = seq
+            .into_vec()
+            .into_iter()
+            .map(|handle| handle as _)
+            .collect();
+        let nhandles = handles.len();
+
+        if nhandles == 0 {
+            return if wait_all {
+                Ok(vm.ctx.none())
+            } else {
+                Ok(vm.ctx.new_list(vec![]).into())
+            };
+        }
+
+        let max_total_objects = (MAXIMUM_WAIT_OBJECTS - 1) * (MAXIMUM_WAIT_OBJECTS - 1);
+        if nhandles > max_total_objects {
+            return Err(vm.new_value_error(format!(
+                "need at most {max_total_objects} handles, got a sequence of length {nhandles}"
+            )));
+        }
+
+        #[cfg(feature = "threading")]
+        let sigint_event = {
+            let is_main = crate::stdlib::_thread::get_ident() == vm.state.main_thread_ident.load();
+            if is_main {
+                let handle = crate::signal::get_sigint_event().map_or_else(
+                    || {
+                        let handle = host_winapi::create_event_w(true, false, None)
+                            .unwrap_or(core::ptr::null_mut());
+                        if !handle.is_null() {
+                            crate::signal::set_sigint_event(handle as isize);
+                        }
+                        handle
+                    },
+                    |handle| handle as host_winapi::Handle,
+                );
+                if handle.is_null() { None } else { Some(handle) }
+            } else {
+                None
+            }
+        };
+        #[cfg(not(feature = "threading"))]
+        let sigint_event: Option<host_winapi::Handle> = None;
+
+        let batched_result = vm.allow_threads(|| {
+            host_winapi::batched_wait_for_multiple_objects(
+                &handles,
+                wait_all,
+                milliseconds,
+                sigint_event,
+            )
+        });
+        match batched_result {
+            Ok(host_winapi::BatchedWaitResult::All) => Ok(vm.ctx.none()),
+            Ok(host_winapi::BatchedWaitResult::Indices(indices)) => Ok(vm
+                .ctx
+                .new_list(
+                    indices
+                        .into_iter()
+                        .map(|index| vm.ctx.new_int(index).into())
+                        .collect(),
+                )
+                .into()),
+            Err(err) => Err(err.to_pyexception(vm)),
+        }
+    }
+
+    // CreateFileMapping - Create or open a named or unnamed file mapping object.
+    #[pyfunction]
+    fn CreateFileMapping(
+        file_handle: WinHandle,
+        _security_attributes: PyObjectRef,
+        protect: u32,
+        max_size_high: u32,
+        max_size_low: u32,
+        name: Option<PyStrRef>,
+        vm: &VirtualMachine,
+    ) -> PyResult<WinHandle> {
+        let name = name
+            .map(|n| n.as_wtf8().to_wide_cstring())
+            .transpose()
+            .map_err(|_| nul_char_error(vm))?;
+        host_winapi::create_file_mapping_w(
+            file_handle.0,
+            protect,
+            max_size_high,
+            max_size_low,
+            name.as_deref(),
+        )
+        .map(WinHandle)
+        .map_err(|e| e.to_pyexception(vm))
+    }
+
+    // OpenFileMapping - Open a named file mapping object.
+    #[pyfunction]
+    fn OpenFileMapping(
+        desired_access: u32,
+        inherit_handle: bool,
+        name: PyStrRef,
+        vm: &VirtualMachine,
+    ) -> PyResult<WinHandle> {
+        let name = name
+            .as_wtf8()
+            .to_wide_cstring()
+            .map_err(|_| nul_char_error(vm))?;
+        host_winapi::open_file_mapping_w(desired_access, inherit_handle, &name)
+            .map(WinHandle)
+            .map_err(|e| e.to_pyexception(vm))
+    }
+
+    // MapViewOfFile - Map a view of a file mapping into the address space.
+    #[pyfunction]
+    fn MapViewOfFile(
+        file_map: WinHandle,
+        desired_access: u32,
+        file_offset_high: u32,
+        file_offset_low: u32,
+        number_bytes: usize,
+        vm: &VirtualMachine,
+    ) -> PyResult<isize> {
+        host_winapi::map_view_of_file(
+            file_map.0,
+            desired_access,
+            file_offset_high,
+            file_offset_low,
+            number_bytes,
+        )
+        .map_err(|e| e.to_pyexception(vm))
+    }
+
+    // UnmapViewOfFile - Unmap a mapped view of a file.
+    #[pyfunction]
+    fn UnmapViewOfFile(address: PyObjectRef, vm: &VirtualMachine) -> PyResult {
+        let value = WinHandle::from_bitfield(&address, vm, "UnmapViewOfFile", "argument")?;
+        host_winapi::unmap_view_of_file(value.0 as isize).map_err(|e| e.to_pyexception(vm))?;
+        Ok(vm.ctx.none())
+    }
+
+    // VirtualQuerySize - Return the size of a memory region.
+    #[pyfunction]
+    fn VirtualQuerySize(address: PyObjectRef, vm: &VirtualMachine) -> PyResult {
+        let value = WinHandle::from_bitfield(&address, vm, "VirtualQuerySize", "argument")?;
+        let size =
+            host_winapi::virtual_query_size(value.0 as isize).map_err(|e| e.to_pyexception(vm))?;
+        Ok(vm.ctx.new_int(size).into())
+    }
+
+    #[derive(FromArgs)]
+    #[from_args(legacy, fname = "CopyFile2")]
+    struct CopyFile2Args {
+        #[pyarg(any)]
+        existing_file_name: ArgWideString,
+        #[pyarg(any)]
+        new_file_name: ArgWideString,
+        #[pyarg(any)]
+        flags: u32,
+        #[pyarg(any, default)]
+        progress_routine: Option<PyObjectRef>,
+    }
+
+    #[pyfunction]
+    fn CopyFile2(args: CopyFile2Args, vm: &VirtualMachine) -> PyResult<()> {
+        let _ = args.progress_routine;
+        let src_wide = &args.existing_file_name.wide;
+        let dst_wide = &args.new_file_name.wide;
+        vm.audit("_winapi.CopyFile2", || {
+            (
+                audit_wide(Some(src_wide), vm),
+                audit_wide(Some(dst_wide), vm),
+                args.flags,
+            )
+        })?;
+        host_winapi::copy_file2(src_wide, dst_wide, args.flags).map_err(|e| e.to_pyexception(vm))
+    }
+
+    #[derive(FromArgs)]
+    struct MimeRegistryArgs {
+        #[pyarg(any)]
+        on_type_read: PyObjectRef,
+    }
+
+    #[pyfunction]
+    fn _mimetypes_read_windows_registry(
+        args: MimeRegistryArgs,
+        vm: &VirtualMachine,
+    ) -> PyResult<()> {
+        let on_type_read = args.on_type_read;
+        host_winapi::read_windows_mimetype_registry_in_batches(|entries| {
+            for (mime_type, ext) in entries.drain(..) {
+                on_type_read.call((vm.ctx.new_str(mime_type), vm.ctx.new_str(ext)), vm)?;
+            }
+            Ok(())
+        })
+        .map_err(|err| match err {
+            host_winapi::MimeRegistryReadError::Os(err) => vm.new_os_error(err as i32),
+            host_winapi::MimeRegistryReadError::Callback(err) => err,
+        })
+    }
+}

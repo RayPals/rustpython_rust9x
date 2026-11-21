@@ -1,0 +1,10 @@
+[package]
+name = "wasm-runtime"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rustpython-wasi-host = { path = "../../../crates/wasi_host" }
+wasmer = "7.5.0"
+
+[workspace]

@@ -1,0 +1,3 @@
+exit=0
+WIN98_IMAGE_AND_OPTIONAL_API_OK
+WIN98_FIBER_FALLBACK_OK: 640 callbacks, nested growth, base-fiber reuse, thread exit

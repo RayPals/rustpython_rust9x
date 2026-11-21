@@ -1,0 +1,528 @@
+/* Access to the unicode database.
+   See also: https://docs.python.org/3/library/unicodedata.html
+*/
+
+// spell-checker:ignore nfkc unistr unidata ucnhash
+
+pub(crate) use unicodedata::module_def;
+
+use rustpython_unicode::{self as unicode_core, NormalizeForm};
+
+use crate::vm::{Py, PyResult, VirtualMachine, builtins::PyStr};
+
+fn normalize_form(form: &Py<PyStr>, vm: &VirtualMachine) -> PyResult<NormalizeForm> {
+    match form.as_bytes() {
+        b"NFC" => Ok(NormalizeForm::Nfc),
+        b"NFKC" => Ok(NormalizeForm::Nfkc),
+        b"NFD" => Ok(NormalizeForm::Nfd),
+        b"NFKD" => Ok(NormalizeForm::Nfkd),
+        _ => Err(vm.new_value_error("invalid normalization form")),
+    }
+}
+
+#[pymodule]
+mod unicodedata {
+    use alloc::ffi::CString;
+    use rustpython_unicode::{UNICODE_VERSION, UNICODE_VERSION_LEGACY};
+
+    use super::{normalize_form, unicode_core};
+    use crate::vm::{
+        Py, PyObject, PyObjectRef, PyPayload, PyResult, VirtualMachine,
+        builtins::{PyBytes, PyModule, PyStr, PyStrRef, PyUtf8Str},
+        common::lock::PyMutex,
+        function::OptionalArg,
+        protocol::PyIterReturn,
+        types::{IterNext, Iterable, Representable, SelfIter},
+    };
+    use itertools::Itertools;
+    use rustpython_common::wtf8::{CodePoint, Wtf8Buf};
+    use unicode_core::grapheme::{self, GraphemeBreakState};
+
+    fn grapheme_char(character: &Py<PyStr>, vm: &VirtualMachine) -> PyResult<CodePoint> {
+        character
+            .as_wtf8()
+            .code_points()
+            .exactly_one()
+            .map_err(|_| vm.new_type_error("argument must be a unicode character, not str"))
+    }
+
+    fn property_char(
+        character: &PyObject,
+        function: &str,
+        vm: &VirtualMachine,
+    ) -> PyResult<CodePoint> {
+        let Some(character_str) = character.downcast_ref::<PyStr>() else {
+            let kind = if vm.is_none(character) {
+                "None".to_owned()
+            } else {
+                character.class().slot_name().to_string()
+            };
+            let kind = &kind[..kind.floor_char_boundary(50.min(kind.len()))];
+            return Err(vm.new_type_error(format!(
+                "{function}() argument must be a unicode character, not {kind}"
+            )));
+        };
+        character_str
+            .as_wtf8()
+            .code_points()
+            .exactly_one()
+            .map_err(|_| {
+                vm.new_type_error(format!(
+                    "{function}(): argument must be a unicode character, not a string of length {}",
+                    character_str.char_len()
+                ))
+            })
+    }
+
+    /// Return True if the character has the XID_Start property, else False.
+    #[pyfunction]
+    fn isxidstart(chr: PyObjectRef, vm: &VirtualMachine) -> PyResult<bool> {
+        Ok(property_char(&chr, "isxidstart", vm)?
+            .to_char()
+            .is_some_and(unicode_core::identifier::is_xid_start))
+    }
+
+    /// Return True if the character has the XID_Continue property, else False.
+    #[pyfunction]
+    fn isxidcontinue(chr: PyObjectRef, vm: &VirtualMachine) -> PyResult<bool> {
+        Ok(property_char(&chr, "isxidcontinue", vm)?
+            .to_char()
+            .is_some_and(unicode_core::identifier::is_xid_continue))
+    }
+
+    /// Return block assigned to the character chr.
+    #[pyfunction]
+    fn block(chr: PyObjectRef, vm: &VirtualMachine) -> PyResult<&'static str> {
+        property_char(&chr, "block", vm).map(unicode_core::data::block)
+    }
+
+    #[pyfunction]
+    fn grapheme_cluster_break(chr: PyStrRef, vm: &VirtualMachine) -> PyResult<&'static str> {
+        grapheme_char(&chr, vm).map(grapheme::grapheme_cluster_break)
+    }
+
+    #[pyfunction]
+    fn indic_conjunct_break(chr: PyStrRef, vm: &VirtualMachine) -> PyResult<&'static str> {
+        grapheme_char(&chr, vm).map(grapheme::indic_conjunct_break)
+    }
+
+    #[pyfunction]
+    fn extended_pictographic(chr: PyStrRef, vm: &VirtualMachine) -> PyResult<bool> {
+        grapheme_char(&chr, vm).map(grapheme::extended_pictographic)
+    }
+
+    #[pyclass(no_attr, name = "Segment", traverse)]
+    #[derive(Debug, PyPayload)]
+    struct Segment {
+        string: PyStrRef,
+        #[pytraverse(skip)]
+        start: usize,
+        #[pytraverse(skip)]
+        end: usize,
+        #[pytraverse(skip)]
+        bytes: core::ops::Range<usize>,
+    }
+
+    #[pyclass(with(Representable), flags(IMMUTABLETYPE, DISALLOW_INSTANTIATION))]
+    impl Segment {
+        #[pygetset]
+        fn start(zelf: &Py<Self>) -> usize {
+            zelf.start
+        }
+
+        #[pygetset]
+        fn end(zelf: &Py<Self>) -> usize {
+            zelf.end
+        }
+
+        #[pymethod]
+        fn __str__(zelf: &Py<Self>, vm: &VirtualMachine) -> PyStrRef {
+            vm.ctx.new_str(&zelf.string.as_wtf8()[zelf.bytes.clone()])
+        }
+    }
+
+    impl Representable for Segment {
+        #[inline]
+        fn repr_str(zelf: &Py<Self>, _vm: &VirtualMachine) -> PyResult<String> {
+            Ok(format!("<Segment {}:{}>", zelf.start, zelf.end))
+        }
+    }
+
+    #[derive(Debug)]
+    struct GraphemePosition {
+        start: usize,
+        start_byte: usize,
+        pos: usize,
+        pos_byte: usize,
+        end: usize,
+        end_byte: usize,
+        state: GraphemeBreakState,
+    }
+
+    #[pyclass(no_attr, name = "GraphemeBreakIterator", traverse)]
+    #[derive(Debug, PyPayload)]
+    struct GraphemeBreakIterator {
+        string: PyStrRef,
+        #[pytraverse(skip)]
+        position: PyMutex<GraphemePosition>,
+    }
+
+    #[pyclass(with(IterNext, Iterable), flags(IMMUTABLETYPE, DISALLOW_INSTANTIATION))]
+    impl GraphemeBreakIterator {}
+
+    impl SelfIter for GraphemeBreakIterator {}
+
+    impl IterNext for GraphemeBreakIterator {
+        fn next(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
+            let mut position = zelf.position.lock();
+            if position.start >= position.end {
+                return Ok(PyIterReturn::StopIteration(None));
+            }
+            let start = position.start;
+            let start_byte = position.start_byte;
+            let scan_byte = position.pos_byte;
+            let mut points = zelf.string.as_wtf8()[scan_byte..position.end_byte]
+                .code_point_indices()
+                .peekable();
+            let (end, end_byte) = loop {
+                let Some((offset, point)) = points.next() else {
+                    position.start = position.pos;
+                    position.start_byte = position.end_byte;
+                    break (position.pos, position.end_byte);
+                };
+                let byte = scan_byte + offset;
+                let index = position.pos;
+                let boundary = position.state.advance(point);
+                position.pos += 1;
+                position.pos_byte = points
+                    .peek()
+                    .map_or(position.end_byte, |(offset, _)| scan_byte + offset);
+                if boundary {
+                    position.start = index;
+                    position.start_byte = byte;
+                    break (index, byte);
+                }
+            };
+            drop(position);
+            Ok(PyIterReturn::Return(
+                Segment {
+                    string: zelf.string.clone(),
+                    start,
+                    end,
+                    bytes: start_byte..end_byte,
+                }
+                .into_ref(&vm.ctx)
+                .into(),
+            ))
+        }
+    }
+
+    #[derive(FromArgs)]
+    struct IterGraphemesArgs {
+        #[pyarg(positional)]
+        unistr: PyStrRef,
+        #[pyarg(positional, optional, py_default = "0")]
+        start: OptionalArg<PyObjectRef>,
+        #[pyarg(positional, optional, py_default = "sys.maxsize")]
+        end: OptionalArg<PyObjectRef>,
+    }
+
+    #[pyfunction]
+    fn iter_graphemes(
+        args: IterGraphemesArgs,
+        vm: &VirtualMachine,
+    ) -> PyResult<crate::vm::PyRef<GraphemeBreakIterator>> {
+        let IterGraphemesArgs { unistr, start, end } = args;
+        // Convert in argument order, including overflow, before adjusting bounds.
+        let index = |arg: OptionalArg<PyObjectRef>, default| -> PyResult<isize> {
+            match arg {
+                OptionalArg::Present(value) => value.try_index(vm)?.try_to_primitive(vm),
+                OptionalArg::Missing => Ok(default),
+            }
+        };
+        let mut start = index(start, 0)?;
+        let mut end = index(end, isize::MAX)?;
+        let len = unistr.char_len() as isize;
+        if end > len {
+            end = len;
+        } else if end < 0 {
+            end = (end + len).max(0);
+        }
+        if start < 0 {
+            start = (start + len).max(0);
+        }
+        let start = start as usize;
+        let end = end as usize;
+        let start_byte = unistr.char_index_to_byte(start);
+        let end_byte = unistr.char_index_to_byte(end);
+        Ok(GraphemeBreakIterator {
+            string: unistr,
+            position: PyMutex::new(GraphemePosition {
+                start,
+                start_byte,
+                pos: start,
+                pos_byte: start_byte,
+                end,
+                end_byte,
+                state: GraphemeBreakState::default(),
+            }),
+        }
+        .into_ref(&vm.ctx))
+    }
+
+    pub(crate) fn module_exec(vm: &VirtualMachine, module: &Py<PyModule>) -> PyResult<()> {
+        __module_exec(vm, module);
+
+        // Add UCD methods as module-level functions
+        let ucd: PyObjectRef = Ucd::new(true).into_ref(&vm.ctx).into();
+
+        for attr in [
+            "category",
+            "lookup",
+            "name",
+            "bidirectional",
+            "combining",
+            "decimal",
+            "decomposition",
+            "digit",
+            "east_asian_width",
+            "is_normalized",
+            "mirrored",
+            "normalize",
+            "numeric",
+        ] {
+            let func = ucd.get_attr(attr, vm)?;
+            func.set_attr("__module__", vm.ctx.new_str("unicodedata"), vm)?;
+            module.set_attr(attr, func, vm)?;
+        }
+
+        Ok(())
+    }
+
+    #[pyattr]
+    #[pyclass(name = "UCD")]
+    #[derive(Debug, PyPayload)]
+    pub(super) struct Ucd {
+        inner: unicode_core::Ucd,
+        /// Owns the bytes `unidata_version` points at.
+        #[expect(dead_code, reason = "keeps the version string alive")]
+        version_owner: CString,
+        #[pymember]
+        unidata_version: crate::vm::builtins::descriptor::CStrMember,
+    }
+
+    impl Ucd {
+        pub(super) fn new(modern: bool) -> Self {
+            let inner = unicode_core::Ucd::new(modern);
+            let text = if modern {
+                UNICODE_VERSION
+            } else {
+                UNICODE_VERSION_LEGACY
+            };
+            let version_owner = CString::new(text)
+                .expect("Embedded Unicode version string should never have internal NULs");
+            let unidata_version =
+                crate::vm::builtins::descriptor::CStrMember::new(version_owner.as_ptr());
+            Self {
+                inner,
+                version_owner,
+                unidata_version,
+            }
+        }
+
+        fn extract_char(&self, character: &Py<PyStr>, vm: &VirtualMachine) -> PyResult<CodePoint> {
+            character
+                .as_wtf8()
+                .code_points()
+                .exactly_one()
+                .map_err(|_| vm.new_type_error("argument must be an unicode character, not str"))
+        }
+    }
+
+    #[pyclass(flags(DISALLOW_INSTANTIATION))]
+    impl Ucd {
+        #[pymethod]
+        fn category(zelf: &Py<Self>, chr: PyStrRef, vm: &VirtualMachine) -> PyResult<&'static str> {
+            zelf.extract_char(&chr, vm).map(|c| zelf.inner.category(c))
+        }
+
+        #[pymethod]
+        fn lookup(zelf: &Py<Self>, name: PyObjectRef, vm: &VirtualMachine) -> PyResult<String> {
+            let name_bytes = if let Some(bytes) = name.downcast_ref::<PyBytes>() {
+                bytes.as_bytes()
+            } else {
+                name.try_downcast_ref::<PyUtf8Str>(vm)?.as_bytes()
+            };
+            // CPython's generated Unicode name database limits names to 256 bytes.
+            if name_bytes.len() > 256 {
+                return Err(vm.new_key_error(vm.ctx.new_str("name too long").into()));
+            }
+            if let Ok(name_str) = core::str::from_utf8(name_bytes)
+                && let Some(found) = zelf.inner.lookup(name_str)
+            {
+                return Ok(match found {
+                    unicode_core::LookupResult::Character(ch) => ch.to_string(),
+                    unicode_core::LookupResult::Sequence(seq) => seq.to_string(),
+                });
+            }
+            // CPython formats the failed name as a NUL-terminated UTF-8 string.
+            let prefix = name_bytes
+                .split(|&byte| byte == 0)
+                .next()
+                .unwrap_or_default();
+            let display = String::from_utf8_lossy(prefix);
+            Err(vm.new_key_error(
+                vm.ctx
+                    .new_str(format!("undefined character name '{display}'"))
+                    .into(),
+            ))
+        }
+
+        #[pymethod]
+        fn name(
+            zelf: &Py<Self>,
+            chr: PyStrRef,
+            default: OptionalArg<PyObjectRef>,
+            vm: &VirtualMachine,
+        ) -> PyResult {
+            if let Some(name) = zelf.extract_char(&chr, vm)?.to_char().and_then(|ch| {
+                zelf.inner
+                    .membership(ch)
+                    .then(|| unicode_core::character_name(ch))
+                    .flatten()
+            }) {
+                return Ok(vm.ctx.new_str(name).into());
+            }
+            default.ok_or_else(|| vm.new_value_error("no such name"))
+        }
+
+        #[pymethod]
+        fn bidirectional(
+            zelf: &Py<Self>,
+            chr: PyStrRef,
+            vm: &VirtualMachine,
+        ) -> PyResult<&'static str> {
+            zelf.extract_char(&chr, vm)
+                .map(|c| zelf.inner.bidirectional(c))
+        }
+
+        #[pymethod]
+        fn east_asian_width(
+            zelf: &Py<Self>,
+            chr: PyStrRef,
+            vm: &VirtualMachine,
+        ) -> PyResult<&'static str> {
+            zelf.extract_char(&chr, vm)
+                .map(|c| zelf.inner.east_asian_width(c))
+        }
+
+        #[pymethod]
+        fn normalize(
+            zelf: &Py<Self>,
+            form: PyStrRef,
+            unistr: PyStrRef,
+            vm: &VirtualMachine,
+        ) -> PyResult<Wtf8Buf> {
+            if unistr.is_empty() {
+                return Ok(Wtf8Buf::new());
+            }
+            let form = normalize_form(&form, vm)?;
+            Ok(zelf.inner.normalize(form, unistr.as_wtf8()))
+        }
+
+        #[pymethod]
+        fn is_normalized(
+            zelf: &Py<Self>,
+            form: PyStrRef,
+            unistr: PyStrRef,
+            vm: &VirtualMachine,
+        ) -> PyResult<bool> {
+            if unistr.is_empty() {
+                return Ok(true);
+            }
+            let form = normalize_form(&form, vm)?;
+            Ok(zelf.inner.is_normalized(form, unistr.as_wtf8()))
+        }
+
+        #[pymethod]
+        fn mirrored(zelf: &Py<Self>, chr: PyStrRef, vm: &VirtualMachine) -> PyResult<i32> {
+            zelf.extract_char(&chr, vm).map(|c| zelf.inner.mirrored(c))
+        }
+
+        #[pymethod]
+        fn combining(zelf: &Py<Self>, chr: PyStrRef, vm: &VirtualMachine) -> PyResult<u8> {
+            zelf.extract_char(&chr, vm).map(|c| zelf.inner.combining(c))
+        }
+
+        #[pymethod]
+        fn decomposition(zelf: &Py<Self>, chr: PyStrRef, vm: &VirtualMachine) -> PyResult<String> {
+            zelf.extract_char(&chr, vm)
+                .map(|c| zelf.inner.decomposition(c))
+        }
+
+        #[pymethod]
+        fn digit(
+            zelf: &Py<Self>,
+            chr: PyStrRef,
+            default: OptionalArg<PyObjectRef>,
+            vm: &VirtualMachine,
+        ) -> PyResult<Option<PyObjectRef>> {
+            let ch = zelf.extract_char(&chr, vm)?;
+            zelf.inner
+                .digit(ch)
+                .map(|value| vm.ctx.new_int(value).into())
+                .or_else(|| default.present())
+                .map(Option::Some)
+                .ok_or_else(|| vm.new_value_error("not a digit"))
+        }
+
+        #[pymethod]
+        fn decimal(
+            zelf: &Py<Self>,
+            chr: PyStrRef,
+            default: OptionalArg<PyObjectRef>,
+            vm: &VirtualMachine,
+        ) -> PyResult<Option<PyObjectRef>> {
+            let ch = zelf.extract_char(&chr, vm)?;
+            zelf.inner
+                .decimal(ch)
+                .map(|value| vm.ctx.new_int(value).into())
+                .or_else(|| default.present())
+                .map(Option::Some)
+                .ok_or_else(|| vm.new_value_error("not a decimal"))
+        }
+
+        #[pymethod]
+        fn numeric(
+            zelf: &Py<Self>,
+            chr: PyStrRef,
+            default: OptionalArg<PyObjectRef>,
+            vm: &VirtualMachine,
+        ) -> PyResult<Option<PyObjectRef>> {
+            let ch = zelf.extract_char(&chr, vm)?;
+            zelf.inner
+                .numeric(ch)
+                .map(|value| vm.ctx.new_float(value).into())
+                .or_else(|| default.present())
+                .map(Option::Some)
+                .ok_or_else(|| vm.new_value_error("not a numeric character"))
+        }
+    }
+
+    #[cfg(feature = "ucd_3_2_0")]
+    #[pyattr]
+    fn ucd_3_2_0(vm: &VirtualMachine) -> crate::vm::PyRef<Ucd> {
+        Ucd::new(false).into_ref(&vm.ctx)
+    }
+
+    #[pyattr]
+    #[allow(non_snake_case)]
+    fn _ucnhash_CAPI(vm: &VirtualMachine) -> crate::vm::PyRef<crate::vm::builtins::PyCapsule> {
+        vm.new_unicode_name_capsule()
+    }
+
+    #[pyattr]
+    fn unidata_version(_vm: &VirtualMachine) -> String {
+        UNICODE_VERSION.into()
+    }
+}

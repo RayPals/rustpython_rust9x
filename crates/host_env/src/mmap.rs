@@ -1,0 +1,700 @@
+#![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "These helpers are thin wrappers around raw Windows mapping APIs."
+)]
+
+use std::io;
+
+#[cfg(unix)]
+pub use libc::{
+    MADV_DONTNEED, MADV_NORMAL, MADV_RANDOM, MADV_SEQUENTIAL, MADV_WILLNEED, MS_ASYNC,
+    MS_INVALIDATE, MS_SYNC, PROT_EXEC, PROT_READ, PROT_WRITE,
+};
+
+#[cfg(unix)]
+bitflags::bitflags! {
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub struct MapFlags: libc::c_int {
+        const MAP_SHARED = libc::MAP_SHARED;
+        const MAP_PRIVATE = libc::MAP_PRIVATE;
+        const MAP_ANON = libc::MAP_ANON;
+        const MAP_ANONYMOUS = libc::MAP_ANONYMOUS;
+
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+        const MAP_DENYWRITE = libc::MAP_DENYWRITE;
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+        const MAP_EXECUTABLE = libc::MAP_EXECUTABLE;
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+        const MAP_POPULATE = libc::MAP_POPULATE;
+
+        #[cfg(any(target_os = "linux", target_os = "openbsd", target_os = "netbsd"))]
+        const MAP_STACK = libc::MAP_STACK;
+
+        #[cfg(target_vendor = "apple")]
+        const MAP_NORESERVE = libc::MAP_NORESERVE;
+        #[cfg(target_vendor = "apple")]
+        const MAP_NOEXTEND = libc::MAP_NOEXTEND;
+        #[cfg(target_vendor = "apple")]
+        const MAP_HASSEMAPHORE = libc::MAP_HASSEMAPHORE;
+        #[cfg(target_vendor = "apple")]
+        const MAP_NOCACHE = libc::MAP_NOCACHE;
+        #[cfg(target_vendor = "apple")]
+        const MAP_JIT = libc::MAP_JIT;
+        // libc does not name these `sys/mman.h` flags.
+        #[cfg(target_vendor = "apple")]
+        const MAP_RESILIENT_CODESIGN = 0x2000;
+        #[cfg(target_vendor = "apple")]
+        const MAP_RESILIENT_MEDIA = 0x4000;
+        #[cfg(target_vendor = "apple")]
+        const MAP_32BIT = 0x8000;
+        #[cfg(target_vendor = "apple")]
+        const MAP_TRANSLATED_ALLOW_EXECUTE = 0x20000;
+        #[cfg(target_vendor = "apple")]
+        const MAP_UNIX03 = 0x40000;
+        #[cfg(target_vendor = "apple")]
+        const MAP_TPRO = 0x80000;
+    }
+}
+
+#[cfg(unix)]
+macro_rules! map_flag_consts {
+    ($($name:ident),+ $(,)?) => {
+        $(pub const $name: libc::c_int = MapFlags::$name.bits();)+
+    };
+}
+
+#[cfg(unix)]
+map_flag_consts! {
+    MAP_SHARED, MAP_PRIVATE, MAP_ANON, MAP_ANONYMOUS,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+map_flag_consts! {
+    MAP_DENYWRITE, MAP_EXECUTABLE, MAP_POPULATE,
+}
+
+#[cfg(any(target_os = "linux", target_os = "openbsd", target_os = "netbsd"))]
+map_flag_consts! {
+    MAP_STACK,
+}
+
+#[cfg(target_vendor = "apple")]
+map_flag_consts! {
+    MAP_HASSEMAPHORE, MAP_JIT, MAP_NOCACHE, MAP_NOEXTEND, MAP_NORESERVE,
+    MAP_RESILIENT_CODESIGN, MAP_RESILIENT_MEDIA, MAP_32BIT,
+    MAP_TRANSLATED_ALLOW_EXECUTE, MAP_UNIX03, MAP_TPRO,
+}
+
+#[cfg(target_os = "macos")]
+pub use libc::{MADV_FREE_REUSABLE, MADV_FREE_REUSE};
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "fuchsia",
+    target_os = "freebsd",
+    target_os = "linux",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_vendor = "apple"
+))]
+pub use libc::MADV_FREE;
+
+#[cfg(target_os = "linux")]
+pub use libc::{
+    MADV_DODUMP, MADV_DOFORK, MADV_DONTDUMP, MADV_DONTFORK, MADV_HUGEPAGE, MADV_HWPOISON,
+    MADV_MERGEABLE, MADV_NOHUGEPAGE, MADV_REMOVE, MADV_UNMERGEABLE,
+};
+
+#[cfg(any(
+    target_os = "android",
+    all(
+        target_os = "linux",
+        any(
+            target_arch = "aarch64",
+            target_arch = "arm",
+            target_arch = "powerpc",
+            target_arch = "powerpc64",
+            target_arch = "s390x",
+            target_arch = "x86",
+            target_arch = "x86_64",
+            target_arch = "sparc64"
+        )
+    )
+))]
+pub use libc::MADV_SOFT_OFFLINE;
+
+#[cfg(target_os = "freebsd")]
+pub use libc::{MADV_AUTOSYNC, MADV_CORE, MADV_NOCORE, MADV_NOSYNC, MADV_PROTECT};
+
+pub use libc::EOVERFLOW;
+
+#[cfg(windows)]
+use crate::windows::{CheckWin32Bool, HandleToOwned};
+#[cfg(unix)]
+use crate::{crt_fd, fileutils, posix};
+use memmap2::{Mmap, MmapMut, MmapOptions};
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, IntoRawHandle};
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::{
+        CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ALREADY_EXISTS,
+        ERROR_USER_MAPPED_FILE, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
+    },
+    Storage::FileSystem::{FILE_BEGIN, GetFileSize, SetEndOfFile, SetFilePointerEx},
+    System::{
+        Memory::{
+            CreateFileMappingW, FILE_MAP_COPY, FILE_MAP_READ, FILE_MAP_WRITE, FlushViewOfFile,
+            MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, OpenFileMappingW, PAGE_READONLY,
+            PAGE_READWRITE, PAGE_WRITECOPY, UnmapViewOfFile,
+        },
+        Threading::GetCurrentProcess,
+    },
+};
+
+#[cfg(windows)]
+pub type Handle = HANDLE;
+#[cfg(windows)]
+pub const INVALID_HANDLE: Handle = INVALID_HANDLE_VALUE;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AccessMode {
+    Default = 0,
+    Read = 1,
+    Write = 2,
+    Copy = 3,
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct WindowsMmap {
+    map_handle: Handle,
+    tag: Option<Vec<u16>>,
+    view_ptr: *mut u8,
+    len: usize,
+}
+
+#[derive(Debug)]
+pub enum MappedFile {
+    Read(Mmap),
+    Write(MmapMut),
+}
+
+impl MappedFile {
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Read(mmap) => &mmap[..],
+            Self::Write(mmap) => &mmap[..],
+        }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            Self::Read(_) => panic!("mmap can't modify a readonly memory map."),
+            Self::Write(mmap) => &mut mmap[..],
+        }
+    }
+
+    pub fn as_ptr(&self) -> *const u8 {
+        match self {
+            Self::Read(mmap) => mmap.as_ptr(),
+            Self::Write(mmap) => mmap.as_ptr(),
+        }
+    }
+
+    pub fn flush_range(&self, offset: usize, size: usize, flags: i32) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            if offset > self.as_slice().len() || size > self.as_slice().len() - offset {
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            }
+            let ptr = unsafe { self.as_ptr().add(offset) };
+            let flags = if flags == 0 { MS_SYNC } else { flags };
+            if unsafe { libc::msync(ptr.cast_mut().cast(), size, flags) } == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = flags;
+            match self {
+                Self::Read(_) => Ok(()),
+                Self::Write(mmap) => mmap.flush_range(offset, size),
+            }
+        }
+    }
+
+    /// # Safety
+    /// The backing file must cover the mapping offset plus `new_size`, and no
+    /// exported pointers may remain live while the mapping is moved or shrunk.
+    #[cfg(target_os = "linux")]
+    pub unsafe fn remap(&mut self, new_size: usize) -> io::Result<()> {
+        // memmap2 permits a zero-length mapping, whereas mmap.resize(0) must
+        // preserve mremap's EINVAL result.
+        if new_size == 0 {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        let options = memmap2::RemapOptions::new().may_move(true);
+        match self {
+            Self::Read(mmap) => unsafe { mmap.remap(new_size, options) },
+            Self::Write(mmap) => unsafe { mmap.remap(new_size, options) },
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "redox")))]
+    pub fn madvise_range(&self, start: usize, length: usize, advice: i32) -> io::Result<()> {
+        let ptr = unsafe { self.as_ptr().add(start) };
+        posix::madvise(ptr as usize, length, advice)
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn set_mapping_name(address: usize, size: usize, name: &core::ffi::CStr) -> io::Result<()> {
+    if unsafe {
+        libc::prctl(
+            libc::PR_SET_VMA,
+            libc::PR_SET_VMA_ANON_NAME,
+            address,
+            size,
+            name.as_ptr(),
+        )
+    } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+unsafe impl Send for WindowsMmap {}
+#[cfg(windows)]
+unsafe impl Sync for WindowsMmap {}
+
+#[cfg(windows)]
+impl WindowsMmap {
+    pub fn is_valid(&self) -> bool {
+        !self.map_handle.is_null() && !self.view_ptr.is_null()
+    }
+
+    pub fn size(&self) -> usize {
+        self.len
+    }
+
+    /// Resize like CPython's Windows mmap: retain the old anonymous view until
+    /// its contents have been copied, but release file views before truncation.
+    ///
+    /// # Safety
+    /// No exported pointers may remain live, and the caller must discard an
+    /// invalid mapping after an error before exposing its contents again.
+    pub unsafe fn resize(&mut self, file: Handle, offset: i64, new_size: usize) -> io::Result<()> {
+        let old_data = self.view_ptr;
+        let mut new_size = new_size;
+        let mut max_size = offset as u64 + new_size as u64;
+        let mut file_resize_error = None;
+        unsafe { CloseHandle(self.map_handle) };
+        self.map_handle = core::ptr::null_mut();
+        if let Some(tag) = &self.tag {
+            self.map_handle = unsafe { OpenFileMappingW(FILE_MAP_WRITE, 0, tag.as_ptr()) };
+            if !self.map_handle.is_null() {
+                return Err(io::Error::from_raw_os_error(ERROR_USER_MAPPED_FILE as i32));
+            }
+        }
+        if file != INVALID_HANDLE {
+            unsafe {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: self.view_ptr.cast(),
+                })
+            }
+            .check_win32_bool()?;
+            self.view_ptr = core::ptr::null_mut();
+            if let Err(err) = extend_file(file, max_size as i64) {
+                file_resize_error = Some(err);
+                max_size = self.len as u64;
+                new_size = self.len;
+            }
+        }
+        self.map_handle = unsafe {
+            CreateFileMappingW(
+                file,
+                core::ptr::null(),
+                PAGE_READWRITE,
+                (max_size >> 32) as u32,
+                max_size as u32,
+                self.tag
+                    .as_ref()
+                    .map_or(core::ptr::null(), |tag| tag.as_ptr()),
+            )
+        };
+        let error = unsafe { GetLastError() };
+        // A different mapping may have taken this name between close and create.
+        if error == ERROR_ALREADY_EXISTS {
+            unsafe { CloseHandle(self.map_handle) };
+            self.map_handle = core::ptr::null_mut();
+            return Err(io::Error::from_raw_os_error(error as i32));
+        }
+        if self.map_handle.is_null() {
+            return Err(io::Error::from_raw_os_error(error as i32));
+        }
+        let view = unsafe {
+            MapViewOfFile(
+                self.map_handle,
+                FILE_MAP_WRITE,
+                (offset as u64 >> 32) as u32,
+                offset as u32,
+                new_size,
+            )
+        };
+        if view.Value.is_null() {
+            let err = io::Error::last_os_error();
+            unsafe { CloseHandle(self.map_handle) };
+            self.map_handle = core::ptr::null_mut();
+            return Err(err);
+        }
+        self.view_ptr = view.Value.cast();
+        if file == INVALID_HANDLE {
+            unsafe {
+                core::ptr::copy_nonoverlapping(old_data, self.view_ptr, self.len.min(new_size))
+            };
+            let result = unsafe {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: old_data.cast(),
+                })
+            }
+            .check_win32_bool();
+            self.len = new_size;
+            result?;
+        } else {
+            self.len = new_size;
+        }
+        if let Some(err) = file_resize_error {
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self.view_ptr, self.len) }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { core::slice::from_raw_parts_mut(self.view_ptr, self.len) }
+    }
+
+    pub fn ptr_at(&self, offset: usize) -> *const core::ffi::c_void {
+        unsafe { self.view_ptr.add(offset) as *const _ }
+    }
+
+    pub fn flush_range(&self, offset: usize, size: usize) -> io::Result<()> {
+        flush_view(self.ptr_at(offset), size)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsMmap {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.view_ptr.is_null() {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: self.view_ptr as *mut _,
+                });
+            }
+            if !self.map_handle.is_null() {
+                CloseHandle(self.map_handle);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+pub fn duplicate_handle(handle: Handle) -> io::Result<Handle> {
+    let mut new_handle: Handle = INVALID_HANDLE;
+    unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            handle,
+            GetCurrentProcess(),
+            &mut new_handle,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    }
+    .check_win32_bool()?;
+    Ok(new_handle)
+}
+
+#[cfg(windows)]
+pub fn get_file_len(handle: Handle) -> io::Result<i64> {
+    let mut high: u32 = 0;
+    let low = unsafe { GetFileSize(handle, &mut high) };
+    if low == u32::MAX {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() != Some(0) {
+            return Err(err);
+        }
+    }
+    Ok(((high as i64) << 32) | (low as i64))
+}
+
+#[cfg(unix)]
+pub fn file_len(fd: crt_fd::Borrowed<'_>) -> io::Result<i64> {
+    #[allow(clippy::useless_conversion, reason = "needed for 32-bit platforms")]
+    Ok(fileutils::fstat(fd)?.st_size.into())
+}
+
+/// Inspect Python's raw descriptor without assuming that it is a valid Rust fd.
+/// CPython ignores failed fstat calls and only bounds regular-file mappings.
+#[cfg(unix)]
+pub fn regular_file_len(fd: i32) -> Option<i64> {
+    // Use the same target selection as memmap2's mmap64/off64_t aliases.
+    #[cfg(not(any(
+        target_os = "android",
+        all(target_os = "linux", not(target_env = "musl"))
+    )))]
+    use libc::{fstat, stat as Stat};
+    #[cfg(any(
+        target_os = "android",
+        all(target_os = "linux", not(target_env = "musl"))
+    ))]
+    use libc::{fstat64 as fstat, stat64 as Stat};
+
+    let mut status = core::mem::MaybeUninit::<Stat>::uninit();
+    // SAFETY: fstat accepts an arbitrary integer and initializes status only
+    // on success. No borrowed/owned descriptor is constructed from that input.
+    if unsafe { fstat(fd, status.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let status = unsafe { status.assume_init() };
+    if status.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return None;
+    }
+    #[allow(clippy::useless_conversion, reason = "needed for 32-bit platforms")]
+    i64::try_from(status.st_size).ok()
+}
+
+#[cfg(target_os = "macos")]
+pub fn prepare_file_mapping(fd: i32) {
+    // CPython intentionally ignores F_FULLFSYNC errors, including invalid fds.
+    let _ = unsafe { libc::fcntl(fd, libc::F_FULLFSYNC) };
+}
+
+#[cfg(windows)]
+pub fn prepare_file_mapping(fd: i32) {
+    // Match CPython's historical Windows constructor side effect. Seek errors
+    // are intentionally ignored; CreateFileMapping reports unusable handles.
+    let _ = unsafe { crate::suppress_iph!(libc::lseek(fd, 0, libc::SEEK_SET)) };
+}
+
+#[cfg(windows)]
+pub fn is_invalid_handle_value(handle: isize) -> bool {
+    handle == INVALID_HANDLE as isize
+}
+
+#[cfg(windows)]
+pub fn extend_file(handle: Handle, size: i64) -> io::Result<()> {
+    unsafe { SetFilePointerEx(handle, size, core::ptr::null_mut(), FILE_BEGIN) }
+        .check_win32_bool()?;
+    unsafe { SetEndOfFile(handle) }.check_win32_bool()
+}
+
+#[cfg(unix)]
+pub fn close_descriptor(fd: i32) {
+    if fd >= 0 {
+        let _ = crt_fd::close(unsafe { crt_fd::Owned::from_raw(fd) });
+    }
+}
+
+#[cfg(windows)]
+pub fn close_handle(handle: Handle) {
+    unsafe { CloseHandle(handle) };
+}
+
+#[cfg(windows)]
+pub fn flush_view(ptr: *const core::ffi::c_void, size: usize) -> io::Result<()> {
+    unsafe { FlushViewOfFile(ptr, size) }.check_win32_bool()
+}
+
+#[cfg(windows)]
+pub fn last_error() -> u32 {
+    unsafe { GetLastError() }
+}
+
+#[cfg(windows)]
+pub fn create_mapping(
+    file_handle: Handle,
+    tag: Option<&str>,
+    access: AccessMode,
+    offset: i64,
+    map_size: usize,
+) -> io::Result<WindowsMmap> {
+    let (fl_protect, desired_access) = match access {
+        AccessMode::Default | AccessMode::Write => (PAGE_READWRITE, FILE_MAP_WRITE),
+        AccessMode::Read => (PAGE_READONLY, FILE_MAP_READ),
+        AccessMode::Copy => (PAGE_WRITECOPY, FILE_MAP_COPY),
+    };
+
+    let total_size = (offset as u64)
+        .checked_add(map_size as u64)
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+    let size_hi = (total_size >> 32) as u32;
+    let size_lo = total_size as u32;
+    let tag_wide: Option<Vec<u16>> =
+        tag.map(|tag| tag.encode_utf16().chain(core::iter::once(0)).collect());
+
+    let map_handle = unsafe {
+        CreateFileMappingW(
+            file_handle,
+            core::ptr::null(),
+            fl_protect,
+            size_hi,
+            size_lo,
+            tag_wide
+                .as_ref()
+                .map_or(core::ptr::null(), |tag| tag.as_ptr()),
+        )
+    }
+    .into_owned()
+    .ok_or_else(io::Error::last_os_error)?;
+
+    let off_hi = (offset as u64 >> 32) as u32;
+    let off_lo = offset as u32;
+    let view = unsafe {
+        MapViewOfFile(
+            map_handle.as_raw_handle() as Handle,
+            desired_access,
+            off_hi,
+            off_lo,
+            map_size,
+        )
+    };
+    if view.Value.is_null() {
+        // `map_handle` is closed automatically when dropped on this error path.
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(WindowsMmap {
+        map_handle: map_handle.into_raw_handle() as Handle,
+        tag: tag_wide,
+        view_ptr: view.Value as *mut u8,
+        len: map_size,
+    })
+}
+
+#[cfg(unix)]
+pub fn map_anon(size: usize) -> io::Result<MappedFile> {
+    let mut mmap_opt = MmapOptions::new();
+    mmap_opt.len(size).map_anon().map(MappedFile::Write)
+}
+
+#[cfg(windows)]
+pub fn map_anon(size: usize) -> io::Result<MappedFile> {
+    let mut mmap_opt = MmapOptions::new();
+    mmap_opt.len(size).map_anon().map(MappedFile::Write)
+}
+
+#[cfg(unix)]
+pub fn duplicate_descriptor(fd: i32) -> io::Result<crt_fd::Owned> {
+    // Python supplies an arbitrary integer, so validate it through fcntl before
+    // constructing a Rust descriptor. Only the successful duplicate is owned.
+    let new_fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if new_fd != -1 {
+        return Ok(unsafe { crt_fd::Owned::from_raw(new_fd) });
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() != Some(libc::EINVAL) {
+        return Err(err);
+    }
+    // Older kernels may not support F_DUPFD_CLOEXEC.
+    let new_fd = unsafe { libc::dup(fd) };
+    if new_fd == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let new_fd = unsafe { crt_fd::Owned::from_raw(new_fd) };
+    posix::set_inheritable(new_fd.borrow().into(), false)?;
+    Ok(new_fd)
+}
+
+#[cfg(unix)]
+pub fn map_file(fd: i32, offset: i64, size: usize, access: AccessMode) -> io::Result<MappedFile> {
+    let mut mmap_opt = MmapOptions::new();
+    let mmap_opt = mmap_opt.offset(offset as u64).len(size);
+
+    // len is always explicit, so memmap2 never wraps this raw fd in File to
+    // query metadata. Its mmap syscall rejects invalid descriptors directly.
+    // The caller retains any owned tracking descriptor through this call.
+    let mapped = match access {
+        AccessMode::Default | AccessMode::Write => {
+            unsafe { mmap_opt.map_mut(fd) }.map(MappedFile::Write)?
+        }
+        AccessMode::Read => unsafe { mmap_opt.map(fd) }.map(MappedFile::Read)?,
+        AccessMode::Copy => unsafe { mmap_opt.map_copy(fd) }.map(MappedFile::Write)?,
+    };
+
+    Ok(mapped)
+}
+
+#[cfg(all(unix, not(target_os = "redox")))]
+pub fn validate_advice(advice: i32) -> bool {
+    match advice {
+        libc::MADV_NORMAL
+        | libc::MADV_RANDOM
+        | libc::MADV_SEQUENTIAL
+        | libc::MADV_WILLNEED
+        | libc::MADV_DONTNEED => true,
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd"
+        ))]
+        libc::MADV_FREE => true,
+        #[cfg(target_os = "linux")]
+        libc::MADV_DONTFORK
+        | libc::MADV_DOFORK
+        | libc::MADV_MERGEABLE
+        | libc::MADV_UNMERGEABLE
+        | libc::MADV_HUGEPAGE
+        | libc::MADV_NOHUGEPAGE
+        | libc::MADV_REMOVE
+        | libc::MADV_DONTDUMP
+        | libc::MADV_DODUMP
+        | libc::MADV_HWPOISON => true,
+        #[cfg(target_os = "freebsd")]
+        libc::MADV_NOSYNC
+        | libc::MADV_AUTOSYNC
+        | libc::MADV_NOCORE
+        | libc::MADV_CORE
+        | libc::MADV_PROTECT => true,
+        _ => false,
+    }
+}
+
+#[cfg(windows)]
+pub fn map_handle(
+    handle: Handle,
+    offset: i64,
+    size: usize,
+    access: AccessMode,
+) -> io::Result<MappedFile> {
+    use std::{
+        fs::File,
+        os::windows::io::{FromRawHandle, RawHandle},
+    };
+
+    let file = unsafe { File::from_raw_handle(handle as RawHandle) };
+    let mut mmap_opt = MmapOptions::new();
+    let mmap_opt = mmap_opt.offset(offset as u64).len(size);
+
+    let result = match access {
+        AccessMode::Default | AccessMode::Write => {
+            unsafe { mmap_opt.map_mut(&file) }.map(MappedFile::Write)
+        }
+        AccessMode::Read => unsafe { mmap_opt.map(&file) }.map(MappedFile::Read),
+        AccessMode::Copy => unsafe { mmap_opt.map_copy(&file) }.map(MappedFile::Write),
+    };
+
+    core::mem::forget(file);
+    result
+}

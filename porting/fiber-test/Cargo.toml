@@ -1,0 +1,13 @@
+[package]
+name = "win98-fiber-probe"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+stacker = { path = "../../compat/stacker-win98", features = ["win98-force-legacy"] }
+
+[profile.release]
+panic = "abort"
+
+# Standalone probe, not a member of the interpreter workspace.
+[workspace]

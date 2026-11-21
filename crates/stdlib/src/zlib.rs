@@ -1,0 +1,542 @@
+// spell-checker:ignore compressobj decompressobj zdict chunksize zlibmodule
+
+pub(crate) use zlib::module_def;
+
+#[pymodule]
+mod zlib {
+    use crate::compression::{DecompressArgs, DecompressorArgs};
+    use crate::vm::{
+        Py, PyObject, PyObjectRef, PyPayload, PyResult, VirtualMachine,
+        builtins::{PyBaseExceptionRef, PyBytes, PyBytesRef, PyIntRef, PyStr, PyType, PyTypeRef},
+        common::lock::PyMutex,
+        convert::TryFromObject,
+        function::{ArgBytesLike, ArgCInt, ArgIndex, OptionalArg, PySsize},
+        object::PyAtomicRef,
+        types::Constructor,
+    };
+    use adler32::RollingAdler32 as Adler32;
+    use alloc::fmt;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use num_traits::ToPrimitive;
+    use rustpython_common::compression::zlib as backend;
+
+    #[pyattr]
+    use rustpython_common::compression::zlib::{
+        Z_BEST_COMPRESSION, Z_BEST_SPEED, Z_BLOCK, Z_DEFAULT_COMPRESSION, Z_DEFAULT_STRATEGY,
+        Z_DEFLATED as DEFLATED, Z_FILTERED, Z_FINISH, Z_FIXED, Z_FULL_FLUSH, Z_HUFFMAN_ONLY,
+        Z_NO_COMPRESSION, Z_NO_FLUSH, Z_PARTIAL_FLUSH, Z_RLE, Z_SYNC_FLUSH, Z_TREES,
+    };
+
+    #[pyfunction]
+    fn __getattr__(name: PyObjectRef, vm: &VirtualMachine) -> PyResult {
+        if name.downcast_ref::<PyStr>().and_then(|name| name.to_str()) == Some("__version__") {
+            crate::vm::stdlib::_warnings::warn(
+                vm.ctx.exceptions.deprecation_warning,
+                "'__version__' is deprecated and slated for removal in Python 3.20".to_owned(),
+                1,
+                vm,
+            )?;
+            return Ok(vm.ctx.new_str("1.0").into());
+        }
+        Err(vm.new_attribute_error(format!("module 'zlib' has no attribute {}", name.repr(vm)?)))
+    }
+
+    // We statically link libz-rs, so the compile-time and runtime versions
+    // always match.
+    #[pyattr(name = "ZLIB_RUNTIME_VERSION")]
+    #[pyattr]
+    const ZLIB_VERSION: &str = backend::version();
+
+    #[pyattr]
+    const MAX_WBITS: i32 = backend::MAX_WBITS;
+    #[pyattr]
+    const DEF_BUF_SIZE: usize = backend::DEF_BUF_SIZE;
+    #[pyattr]
+    const DEF_MEM_LEVEL: i32 = backend::DEF_MEM_LEVEL as i32;
+
+    #[pyattr(once)]
+    fn error(vm: &VirtualMachine) -> PyTypeRef {
+        vm.ctx.new_exception_type(
+            "zlib",
+            "error",
+            Some(vec![vm.ctx.exceptions.exception_type.to_owned()]),
+        )
+    }
+
+    #[derive(FromArgs)]
+    struct Adler32Args {
+        #[pyarg(positional)]
+        data: ArgBytesLike,
+        #[pyarg(positional, default = 1)]
+        value: ArgIndex,
+    }
+
+    #[pyfunction]
+    fn adler32(args: Adler32Args) -> u32 {
+        let Adler32Args { data, value } = args;
+        data.with_ref(|data| {
+            let value = value.into_int_ref().as_u32_mask();
+            let mut hasher = Adler32::from_value(value);
+            hasher.update_buffer(data);
+            hasher.hash()
+        })
+    }
+
+    #[derive(FromArgs)]
+    struct Crc32Args {
+        #[pyarg(positional)]
+        data: ArgBytesLike,
+        #[pyarg(positional, default = 0)]
+        value: ArgIndex,
+    }
+
+    #[pyfunction]
+    fn crc32(args: Crc32Args) -> u32 {
+        let Crc32Args { data, value } = args;
+        crate::binascii::crc32_impl(data, value)
+    }
+
+    struct ChecksumValue(u32);
+
+    impl TryFromObject for ChecksumValue {
+        fn try_from_object(vm: &VirtualMachine, obj: PyObjectRef) -> PyResult<Self> {
+            let value = obj.try_index(vm)?;
+            if !value
+                .as_bigint()
+                .to_i64()
+                .is_some_and(|value| (i64::from(i32::MIN)..=i64::from(u32::MAX)).contains(&value))
+            {
+                crate::vm::stdlib::_warnings::warn(
+                    vm.ctx.exceptions.deprecation_warning,
+                    "integer value out of range".to_owned(),
+                    1,
+                    vm,
+                )?;
+            }
+            Ok(Self(value.as_u32_mask()))
+        }
+    }
+
+    #[pyfunction]
+    fn adler32_combine(
+        adler1: ChecksumValue,
+        adler2: ChecksumValue,
+        len2: PyIntRef,
+        vm: &VirtualMachine,
+    ) -> PyResult<u32> {
+        let len2 = len2.try_to_primitive::<backend::ChecksumLength>(vm)?;
+        Ok(backend::adler32_combine(adler1.0, adler2.0, len2))
+    }
+
+    #[pyfunction]
+    fn crc32_combine(
+        crc1: ChecksumValue,
+        crc2: ChecksumValue,
+        len2: PyIntRef,
+        vm: &VirtualMachine,
+    ) -> PyResult<u32> {
+        let len2 = len2.try_to_primitive::<backend::ChecksumLength>(vm)?;
+        Ok(backend::crc32_combine(crc1.0, crc2.0, len2))
+    }
+
+    #[derive(FromArgs)]
+    struct PyFuncCompressArgs {
+        #[pyarg(positional)]
+        data: ArgBytesLike,
+        #[pyarg(any, default = ::Z_DEFAULT_COMPRESSION)]
+        level: ArgCInt,
+        #[pyarg(any, default = ::MAX_WBITS)]
+        wbits: ArgCInt,
+    }
+
+    #[pyfunction]
+    fn compress(args: PyFuncCompressArgs, vm: &VirtualMachine) -> PyResult<PyBytesRef> {
+        let PyFuncCompressArgs { data, level, wbits } = args;
+        let encoded = data.with_ref(|data| {
+            backend::compress(data, level.into_primitive(), wbits.into_primitive())
+        });
+        encoded
+            .map(|data| vm.ctx.new_bytes(data))
+            .map_err(|err| new_init_or_zlib_error(err, vm))
+    }
+
+    #[derive(FromArgs)]
+    struct PyFuncDecompressArgs {
+        #[pyarg(positional)]
+        data: ArgBytesLike,
+        #[pyarg(any, default = ::MAX_WBITS)]
+        wbits: ArgCInt,
+        #[pyarg(any, default = DEF_BUF_SIZE as isize, py_default = "DEF_BUF_SIZE")]
+        bufsize: PySsize,
+    }
+
+    #[pyfunction]
+    fn decompress(args: PyFuncDecompressArgs, vm: &VirtualMachine) -> PyResult<Vec<u8>> {
+        let PyFuncDecompressArgs {
+            data,
+            wbits,
+            bufsize,
+        } = args;
+        let bufsize = usize::try_from(bufsize)
+            .map_err(|_| vm.new_value_error("bufsize cannot be negative"))?;
+        data.with_ref(|data| backend::decompress(data, wbits.into_primitive(), bufsize))
+            .map_err(|err| new_init_or_zlib_error(err, vm))
+    }
+
+    #[derive(FromArgs)]
+    struct DecompressobjArgs {
+        #[pyarg(any, default = ::MAX_WBITS)]
+        wbits: ArgCInt,
+        // Missing dictionary is empty bytes.
+        #[pyarg(any, optional, py_default = "b''")]
+        zdict: OptionalArg<ArgBytesLike>,
+    }
+
+    fn owned_dict(zdict: OptionalArg<ArgBytesLike>) -> Option<Vec<u8>> {
+        zdict
+            .into_option()
+            .map(|dict| dict.with_ref(|data| data.to_vec()))
+    }
+
+    #[pyfunction]
+    fn decompressobj(args: DecompressobjArgs, vm: &VirtualMachine) -> PyResult<PyDecompress> {
+        let decompress =
+            backend::Decompressor::new(args.wbits.into_primitive(), owned_dict(args.zdict))
+                .map_err(|err| new_init_or_zlib_error(err, vm))?;
+        Ok(PyDecompress {
+            inner: PyMutex::new(PyDecompressInner {
+                decompress,
+                unused_data: vm.ctx.empty_bytes.clone(),
+                unconsumed_tail: vm.ctx.empty_bytes.clone(),
+            }),
+        })
+    }
+
+    struct PyDecompressInner {
+        decompress: backend::Decompressor,
+        unused_data: PyBytesRef,
+        unconsumed_tail: PyBytesRef,
+    }
+
+    impl PyDecompressInner {
+        fn sync_visible_state(&mut self, vm: &VirtualMachine) {
+            if self.unused_data.as_bytes() != self.decompress.unused_data() {
+                self.unused_data = vm.ctx.new_bytes(self.decompress.unused_data().to_vec());
+            }
+            if self.unconsumed_tail.as_bytes() != self.decompress.unconsumed_tail() {
+                self.unconsumed_tail = vm.ctx.new_bytes(self.decompress.unconsumed_tail().to_vec());
+            }
+        }
+    }
+
+    #[pyattr]
+    #[pyclass(name = "Decompress", traverse)]
+    #[derive(PyPayload)]
+    struct PyDecompress {
+        #[pytraverse(skip)]
+        inner: PyMutex<PyDecompressInner>,
+    }
+
+    impl fmt::Debug for PyDecompress {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "zlib.Decompress")
+        }
+    }
+
+    #[pyclass(flags(DISALLOW_INSTANTIATION))]
+    impl PyDecompress {
+        fn copy_inner(&self, vm: &VirtualMachine) -> PyResult<Self> {
+            let inner = self.inner.lock();
+            let decompress = inner
+                .decompress
+                .copy()
+                .map_err(|err| vm.new_value_error(err))?;
+            Ok(Self {
+                inner: PyMutex::new(PyDecompressInner {
+                    decompress,
+                    unused_data: inner.unused_data.clone(),
+                    unconsumed_tail: inner.unconsumed_tail.clone(),
+                }),
+            })
+        }
+
+        #[pygetset]
+        fn eof(zelf: &Py<Self>) -> bool {
+            zelf.inner.lock().decompress.eof()
+        }
+
+        #[pygetset]
+        fn unused_data(zelf: &Py<Self>) -> PyBytesRef {
+            zelf.inner.lock().unused_data.clone()
+        }
+
+        #[pygetset]
+        fn unconsumed_tail(zelf: &Py<Self>) -> PyBytesRef {
+            zelf.inner.lock().unconsumed_tail.clone()
+        }
+
+        #[pymethod]
+        fn decompress(
+            zelf: &Py<Self>,
+            args: DecompressArgs,
+            vm: &VirtualMachine,
+        ) -> PyResult<Vec<u8>> {
+            let max_length: usize = args
+                .raw_max_length()
+                .try_into()
+                .map_err(|_| vm.new_value_error("max_length must be non-negative"))?;
+            let max_length = (max_length != 0).then_some(max_length);
+            let data = &*args.data();
+
+            let mut inner = zelf.inner.lock();
+            let result = inner.decompress.decompress(data, max_length);
+            inner.sync_visible_state(vm);
+            result.map_err(|err| new_zlib_error(err, vm))
+        }
+
+        #[pymethod]
+        fn flush(
+            zelf: &Py<Self>,
+            length: OptionalArg<PySsize>,
+            vm: &VirtualMachine,
+        ) -> PyResult<Vec<u8>> {
+            let length = match length {
+                OptionalArg::Present(value) if value <= 0 => {
+                    return Err(vm.new_value_error("length must be greater than zero"));
+                }
+                OptionalArg::Present(value) => value as usize,
+                OptionalArg::Missing => DEF_BUF_SIZE,
+            };
+
+            let mut inner = zelf.inner.lock();
+            let result = inner.decompress.flush(length);
+            inner.sync_visible_state(vm);
+            result.map_err(|err| new_zlib_error(err, vm))
+        }
+
+        #[pymethod]
+        fn copy(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<Self> {
+            zelf.copy_inner(vm)
+        }
+
+        #[pymethod]
+        fn __copy__(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<Self> {
+            zelf.copy_inner(vm)
+        }
+
+        #[pymethod]
+        fn __deepcopy__(
+            zelf: &Py<Self>,
+            _memo: PyObjectRef,
+            vm: &VirtualMachine,
+        ) -> PyResult<Self> {
+            zelf.copy_inner(vm)
+        }
+    }
+
+    #[derive(FromArgs)]
+    struct CompressobjArgs {
+        #[pyarg(any, default = ::Z_DEFAULT_COMPRESSION)]
+        level: ArgCInt,
+        #[pyarg(any, default = ::DEFLATED)]
+        method: ArgCInt,
+        #[pyarg(any, default = ::MAX_WBITS)]
+        wbits: ArgCInt,
+        #[pyarg(any, name = "memLevel", default = ::DEF_MEM_LEVEL)]
+        mem_level: ArgCInt,
+        #[pyarg(any, default = ::Z_DEFAULT_STRATEGY)]
+        strategy: ArgCInt,
+        // Omission is distinct from an explicit None.
+        #[pyarg(any, optional)]
+        zdict: OptionalArg<ArgBytesLike>,
+    }
+
+    #[pyfunction]
+    fn compressobj(args: CompressobjArgs, vm: &VirtualMachine) -> PyResult<PyCompress> {
+        let CompressobjArgs {
+            level,
+            method,
+            wbits,
+            mem_level,
+            strategy,
+            zdict,
+        } = args;
+        let zdict = owned_dict(zdict);
+        let compress = backend::Compressor::new(
+            level.into_primitive(),
+            method.into_primitive(),
+            wbits.into_primitive(),
+            mem_level.into_primitive(),
+            strategy.into_primitive(),
+            zdict.as_deref(),
+        )
+        .map_err(|err| new_init_or_zlib_error(err, vm))?;
+        Ok(PyCompress {
+            inner: PyMutex::new(compress),
+        })
+    }
+
+    #[pyattr]
+    #[pyclass(name = "Compress", traverse)]
+    #[derive(PyPayload)]
+    struct PyCompress {
+        #[pytraverse(skip)]
+        inner: PyMutex<backend::Compressor>,
+    }
+
+    impl fmt::Debug for PyCompress {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "zlib.Compress")
+        }
+    }
+
+    #[pyclass(flags(DISALLOW_INSTANTIATION))]
+    impl PyCompress {
+        fn copy_inner(&self, vm: &VirtualMachine) -> PyResult<Self> {
+            let compress = self
+                .inner
+                .lock()
+                .copy()
+                .map_err(|err| vm.new_value_error(err))?;
+            Ok(Self {
+                inner: PyMutex::new(compress),
+            })
+        }
+
+        #[pymethod]
+        fn compress(zelf: &Py<Self>, data: ArgBytesLike, vm: &VirtualMachine) -> PyResult<Vec<u8>> {
+            data.with_ref(|data| zelf.inner.lock().compress(data))
+                .map_err(|err| new_zlib_error(err, vm))
+        }
+
+        #[pymethod]
+        fn flush(
+            zelf: &Py<Self>,
+            mode: OptionalArg<ArgCInt>,
+            vm: &VirtualMachine,
+        ) -> PyResult<Vec<u8>> {
+            zelf.inner
+                .lock()
+                .flush(mode.map(ArgCInt::into_primitive).unwrap_or(Z_FINISH))
+                .map_err(|err| new_zlib_error(err, vm))
+        }
+
+        #[pymethod]
+        fn copy(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<Self> {
+            zelf.copy_inner(vm)
+        }
+
+        #[pymethod]
+        fn __copy__(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<Self> {
+            zelf.copy_inner(vm)
+        }
+
+        #[pymethod]
+        fn __deepcopy__(
+            zelf: &Py<Self>,
+            _memo: PyObjectRef,
+            vm: &VirtualMachine,
+        ) -> PyResult<Self> {
+            zelf.copy_inner(vm)
+        }
+    }
+
+    fn new_zlib_error(message: impl Into<String>, vm: &VirtualMachine) -> PyBaseExceptionRef {
+        vm.new_exception_msg(vm.class("zlib", "error"), message.into().into())
+    }
+
+    fn new_init_or_zlib_error(
+        error: backend::InitError,
+        vm: &VirtualMachine,
+    ) -> PyBaseExceptionRef {
+        match error {
+            backend::InitError::InvalidOption => {
+                vm.new_value_error("Invalid initialization option")
+            }
+            backend::InitError::Zlib(message) => new_zlib_error(message, vm),
+        }
+    }
+
+    struct PyZlibDecompressorInner {
+        decompress: backend::ZlibDecompressor,
+    }
+
+    #[pyattr]
+    #[pyclass(name = "_ZlibDecompressor", traverse)]
+    #[derive(PyPayload)]
+    struct ZlibDecompressor {
+        #[pytraverse(skip)]
+        inner: PyMutex<PyZlibDecompressorInner>,
+        #[pymember]
+        #[pytraverse(skip)]
+        eof: AtomicBool,
+        #[pymember]
+        #[pytraverse(skip)]
+        needs_input: AtomicBool,
+        #[pymember(type = "object_ex")]
+        unused_data: PyAtomicRef<Option<PyObject>>,
+    }
+
+    impl fmt::Debug for ZlibDecompressor {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "zlib._ZlibDecompressor")
+        }
+    }
+
+    // Keep the symbolic default used by CPython's Clinic signature.
+    #[derive(FromArgs)]
+    struct ZlibDecompressorArgs {
+        #[pyarg(any, default = ::MAX_WBITS)]
+        wbits: ArgCInt,
+        // Missing dictionary is empty bytes.
+        #[pyarg(any, optional, py_default = "b''")]
+        zdict: OptionalArg<ArgBytesLike>,
+    }
+
+    impl Constructor for ZlibDecompressor {
+        type Args = ZlibDecompressorArgs;
+
+        fn py_new(_cls: &Py<PyType>, args: Self::Args, vm: &VirtualMachine) -> PyResult<Self> {
+            let decompress =
+                backend::ZlibDecompressor::new(args.wbits.into_primitive(), owned_dict(args.zdict))
+                    .map_err(|err| new_init_or_zlib_error(err, vm))?;
+            Ok(Self {
+                inner: PyMutex::new(PyZlibDecompressorInner { decompress }),
+                eof: AtomicBool::new(false),
+                needs_input: AtomicBool::new(true),
+                unused_data: PyAtomicRef::from(Some(vm.ctx.empty_bytes.clone().into())),
+            })
+        }
+    }
+
+    #[pyclass(with(Constructor))]
+    impl ZlibDecompressor {
+        #[pymethod]
+        fn decompress(
+            zelf: &Py<Self>,
+            args: DecompressorArgs,
+            vm: &VirtualMachine,
+        ) -> PyResult<Vec<u8>> {
+            let max_length = args.max_length();
+            let data = &*args.data();
+
+            let mut inner = zelf.inner.lock();
+            let result = inner.decompress.decompress(data, max_length);
+            zelf.eof.store(inner.decompress.eof(), Ordering::Relaxed);
+            zelf.needs_input
+                .store(inner.decompress.needs_input(), Ordering::Relaxed);
+            let stale = zelf.unused_data.deref().is_none_or(|obj| {
+                obj.downcast_ref::<PyBytes>()
+                    .is_none_or(|bytes| bytes.as_bytes() != inner.decompress.unused_data())
+            });
+            if stale {
+                let bytes = vm.ctx.new_bytes(inner.decompress.unused_data().to_vec());
+                let _previous = unsafe { zelf.unused_data.swap(Some(bytes.into())) };
+            }
+            result.map_err(|err| match err {
+                backend::DecompressError::Zlib(err) => new_zlib_error(err, vm),
+                backend::DecompressError::Eof => vm.new_eof_error("End of stream already reached"),
+            })
+        }
+    }
+}

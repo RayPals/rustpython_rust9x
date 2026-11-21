@@ -1,0 +1,1319 @@
+pub(crate) use _sre::module_def;
+
+#[pymodule]
+mod _sre {
+    use crate::{
+        Py, PyObject, PyObjectRef, PyPayload, PyRef, PyResult, TryFromObject, VirtualMachine,
+        atomic_func,
+        builtins::{
+            PyCallableIterator, PyDictRef, PyGenericAlias, PyInt, PyList, PyListRef,
+            PyMappingProxy, PyStr, PyStrRef, PyTuple, PyTupleRef, PyTypeRef,
+        },
+        common::wtf8::{Wtf8, Wtf8Buf, wtf8_concat},
+        common::{ascii, hash::PyHash},
+        convert::ToPyObject,
+        function::{ArgCallable, DefaultRepr, PosArgs, PyComparisonValue},
+        protocol::{BufferFlags, PyBuffer, PyCallable, PyMappingMethods},
+        stdlib::sys,
+        types::{AsMapping, Comparable, Hashable, Representable},
+    };
+    use core::str;
+    use crossbeam_utils::atomic::AtomicCell;
+    use itertools::Itertools;
+    use num_traits::ToPrimitive;
+    use rustpython_sre_engine::{
+        Request, SearchIter, SreFlag, State, StrDrive, StringCursor,
+        string::{lower_ascii, lower_unicode},
+    };
+
+    #[pyattr]
+    pub(super) use rustpython_sre_engine::{CODESIZE, MAXGROUPS, MAXREPEAT, SRE_MAGIC as MAGIC};
+
+    #[pyfunction]
+    const fn getcodesize() -> usize {
+        CODESIZE
+    }
+
+    #[pyfunction]
+    fn ascii_iscased(character: i32) -> bool {
+        (b'a' as i32..=b'z' as i32).contains(&character)
+            || (b'A' as i32..=b'Z' as i32).contains(&character)
+    }
+
+    #[pyfunction]
+    fn unicode_iscased(character: i32) -> bool {
+        char::from_u32(character as u32).is_some_and(rustpython_unicode::case::is_cased)
+    }
+
+    #[pyfunction]
+    fn ascii_tolower(character: i32) -> i32 {
+        lower_ascii(character as u32) as i32
+    }
+
+    #[pyfunction]
+    fn unicode_tolower(character: i32) -> i32 {
+        lower_unicode(character as u32) as i32
+    }
+
+    trait SreStr: StrDrive {
+        fn slice(&self, start: usize, end: usize, vm: &VirtualMachine) -> PyObjectRef;
+
+        fn create_request(self, pattern: &Pattern, start: usize, end: usize) -> Request<'_, Self> {
+            let request = Request::new(self, start, end, &pattern.code, false);
+            #[cfg(all(feature = "host_env", any(unix, windows)))]
+            let request = Request {
+                locale: rustpython_sre_engine::Locale {
+                    is_alnum: rustpython_host_env::locale::byte_isalnum,
+                    to_lower: rustpython_host_env::locale::byte_tolower,
+                    to_upper: rustpython_host_env::locale::byte_toupper,
+                },
+                ..request
+            };
+            request
+        }
+    }
+
+    impl SreStr for &[u8] {
+        fn slice(&self, start: usize, end: usize, vm: &VirtualMachine) -> PyObjectRef {
+            vm.ctx
+                .new_bytes(self.iter().take(end).skip(start).copied().collect())
+                .into()
+        }
+    }
+
+    /// A `str` subject with non-ASCII characters, driven through the string's
+    /// own character-index table.
+    ///
+    /// The `&Wtf8` drive answers `count` and `create_cursor` by decoding from
+    /// the start of the subject, so both are O(n) and a scan that restarts at
+    /// successive positions walks the subject once per position. `PyStr`
+    /// already caches its character length and can resolve a character index to
+    /// a byte offset in constant time, so this drive asks the string instead of
+    /// re-deriving: the table it builds on the first lookup is shared by every
+    /// later one, including by `Match` objects that outlive the scan and have
+    /// no cursor of their own to move relative to.
+    ///
+    /// Stepping is the `&Wtf8` drive's, unchanged -- the subject is the same
+    /// buffer, decoded the same way. Only the two operations that resolve a
+    /// position from scratch differ.
+    #[derive(Clone, Copy)]
+    struct Utf8Str<'a>(&'a Py<PyStr>);
+
+    impl StrDrive for Utf8Str<'_> {
+        fn count(&self) -> usize {
+            self.0.char_len()
+        }
+
+        fn create_cursor(&self, n: usize) -> StringCursor {
+            // `StringCursor`'s pointer is private to the engine, so the cursor
+            // is taken from the `&Wtf8` drive at the start of the suffix that
+            // begins at `n` -- an O(1) reslice -- rather than built here.
+            let suffix = &self.0.as_wtf8()[self.0.char_index_to_byte(n)..];
+            let mut cursor = <&Wtf8 as StrDrive>::create_cursor(&suffix, 0);
+            cursor.position = n;
+            cursor
+        }
+
+        fn adjust_cursor(&self, cursor: &mut StringCursor, n: usize) {
+            // Rebuilding is O(1), so it is never the slower branch and the
+            // `&Wtf8` drive's walk-or-restart choice does not apply.
+            *cursor = self.create_cursor(n);
+        }
+
+        fn advance(cursor: &mut StringCursor) -> u32 {
+            <&Wtf8 as StrDrive>::advance(cursor)
+        }
+
+        fn peek(cursor: &StringCursor) -> u32 {
+            <&Wtf8 as StrDrive>::peek(cursor)
+        }
+
+        fn skip(cursor: &mut StringCursor, n: usize) {
+            <&Wtf8 as StrDrive>::skip(cursor, n)
+        }
+
+        fn back_advance(cursor: &mut StringCursor) -> u32 {
+            <&Wtf8 as StrDrive>::back_advance(cursor)
+        }
+
+        fn back_peek(cursor: &StringCursor) -> u32 {
+            <&Wtf8 as StrDrive>::back_peek(cursor)
+        }
+
+        fn back_skip(cursor: &mut StringCursor, n: usize) {
+            <&Wtf8 as StrDrive>::back_skip(cursor, n)
+        }
+    }
+
+    impl SreStr for Utf8Str<'_> {
+        fn slice(&self, start: usize, end: usize, vm: &VirtualMachine) -> PyObjectRef {
+            let end = self.0.char_index_to_byte(end);
+            let start = self.0.char_index_to_byte(start).min(end);
+            vm.ctx
+                .new_str(self.0.as_wtf8()[start..end].to_owned())
+                .into()
+        }
+    }
+
+    /// An all-ASCII `str` subject, driven over its bytes.
+    ///
+    /// For ASCII a character index *is* a byte index, so `&[u8]`'s cursor
+    /// arithmetic is already the right arithmetic: `count` is the byte length
+    /// and `create_cursor` is a pointer offset. The `&Wtf8` drive has to count
+    /// code points from the start of the subject to answer either, once per
+    /// `Request`, which makes a scan that restarts at successive positions --
+    /// `finditer`, or `re` module functions called in a loop -- walk the
+    /// subject again on every call.
+    ///
+    /// Matching is unaffected: `StrDrive` carries no unicode semantics of its
+    /// own, because the engine keys every unicode decision on the compiled
+    /// pattern's opcode rather than on the subject type. Only `slice` differs
+    /// from the `&[u8]` impl, to hand back `str` instead of `bytes`.
+    #[derive(Clone, Copy)]
+    struct AsciiStr<'a>(&'a [u8]);
+
+    impl StrDrive for AsciiStr<'_> {
+        fn count(&self) -> usize {
+            <&[u8] as StrDrive>::count(&self.0)
+        }
+
+        fn create_cursor(&self, n: usize) -> StringCursor {
+            <&[u8] as StrDrive>::create_cursor(&self.0, n)
+        }
+
+        fn adjust_cursor(&self, cursor: &mut StringCursor, n: usize) {
+            <&[u8] as StrDrive>::adjust_cursor(&self.0, cursor, n)
+        }
+
+        fn advance(cursor: &mut StringCursor) -> u32 {
+            <&[u8] as StrDrive>::advance(cursor)
+        }
+
+        fn peek(cursor: &StringCursor) -> u32 {
+            <&[u8] as StrDrive>::peek(cursor)
+        }
+
+        fn skip(cursor: &mut StringCursor, n: usize) {
+            <&[u8] as StrDrive>::skip(cursor, n)
+        }
+
+        fn back_advance(cursor: &mut StringCursor) -> u32 {
+            <&[u8] as StrDrive>::back_advance(cursor)
+        }
+
+        fn back_peek(cursor: &StringCursor) -> u32 {
+            <&[u8] as StrDrive>::back_peek(cursor)
+        }
+
+        fn back_skip(cursor: &mut StringCursor, n: usize) {
+            <&[u8] as StrDrive>::back_skip(cursor, n)
+        }
+    }
+
+    impl SreStr for AsciiStr<'_> {
+        fn slice(&self, start: usize, end: usize, vm: &VirtualMachine) -> PyObjectRef {
+            let end = end.min(self.0.len());
+            let start = start.min(end);
+            // The subject is ASCII, so any span of it is valid UTF-8 and the
+            // span is a reslice rather than a walk from the subject's start.
+            let s = str::from_utf8(&self.0[start..end]).expect("ascii subject");
+            vm.ctx.new_str(s).into()
+        }
+    }
+
+    #[derive(FromArgs)]
+    struct CompileArgs {
+        #[pyarg(any)]
+        pattern: PyObjectRef,
+        #[pyarg(any)]
+        flags: i32,
+        #[pyarg(any)]
+        code: PyObjectRef,
+        #[pyarg(any)]
+        groups: usize,
+        #[pyarg(any)]
+        groupindex: PyDictRef,
+        #[pyarg(any)]
+        indexgroup: PyObjectRef,
+    }
+
+    #[pyfunction]
+    fn compile(args: CompileArgs, vm: &VirtualMachine) -> PyResult<Pattern> {
+        let CompileArgs {
+            pattern,
+            flags,
+            code,
+            groups,
+            groupindex,
+            indexgroup,
+        } = args;
+        // FIXME:
+        // pattern could only be None if called by re.Scanner
+        // re.Scanner has no official API and in CPython's implement
+        // isbytes will be hanging (-1)
+        // here is just a hack to let re.Scanner works only with str not bytes
+        let isbytes = !vm.is_none(&pattern) && !pattern.downcastable::<PyStr>();
+        let code = code.try_to_value(vm)?;
+        Ok(Pattern {
+            pattern,
+            flags,
+            code,
+            groups,
+            groupindex,
+            indexgroup: indexgroup.try_to_value(vm)?,
+            isbytes,
+        })
+    }
+
+    #[pyattr]
+    #[pyclass(name = "SRE_Template")]
+    #[derive(Debug, PyPayload)]
+    struct Template {
+        literal: PyObjectRef,
+        items: Vec<(usize, PyObjectRef)>,
+    }
+
+    /// One `TemplateObject.items` element: `Py_ssize_t` index, object pointer.
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct SreTemplateItem {
+        _index: isize,
+        _literal: *mut PyObject,
+    }
+
+    #[pyclass(itemsize = core::mem::size_of::<SreTemplateItem>())]
+    impl Template {
+        fn compile(
+            pattern: PyRef<Pattern>,
+            repl: PyObjectRef,
+            vm: &VirtualMachine,
+        ) -> PyResult<PyRef<Self>> {
+            let re = vm.import("re", 0)?;
+            let func = re.get_attr("_compile_template", vm)?;
+            let result = func.call((pattern, repl), vm)?;
+            result
+                .downcast::<Self>()
+                .map_err(|_| vm.new_runtime_error("expected SRE_Template"))
+        }
+    }
+
+    #[pyfunction]
+    fn template(
+        _pattern: PyObjectRef,
+        template: PyListRef,
+        vm: &VirtualMachine,
+    ) -> PyResult<Template> {
+        let err = || vm.new_type_error("invalid template");
+
+        let mut items = Vec::with_capacity(1);
+        let v = template.borrow_vec();
+        let literal = v.first().ok_or_else(err)?.clone();
+        let (trunks, []) = v[1..].as_chunks::<2>() else {
+            return Err(err());
+        };
+
+        for trunk in trunks {
+            let index: usize = trunk[0]
+                .downcast_ref::<PyInt>()
+                .ok_or_else(|| vm.new_type_error("expected usize"))?
+                .try_to_primitive(vm)?;
+            items.push((index, trunk[1].clone()));
+        }
+
+        Ok(Template { literal, items })
+    }
+
+    #[derive(FromArgs)]
+    struct GroupArg {
+        #[pyarg(positional, default = 0)]
+        group: PyObjectRef,
+    }
+
+    #[derive(FromArgs)]
+    struct ExpandArgs {
+        #[pyarg(any)]
+        template: PyObjectRef,
+    }
+
+    #[derive(FromArgs)]
+    struct DefaultArg {
+        // Missing default is None.
+        #[pyarg(any, default = None)]
+        default: Option<PyObjectRef>,
+    }
+
+    /// A position in the searched string, taken as a Py_ssize_t; a negative
+    /// one means the start of the string.
+    #[derive(Clone, Copy)]
+    struct StringPos(usize);
+
+    impl StringPos {
+        const fn py_default(self) -> DefaultRepr {
+            DefaultRepr::Int(self.0 as i128)
+        }
+    }
+
+    impl TryFromObject for StringPos {
+        fn try_from_object(vm: &VirtualMachine, obj: PyObjectRef) -> PyResult<Self> {
+            let pos: isize = obj.try_into_value(vm)?;
+            Ok(Self(pos.max(0) as usize))
+        }
+    }
+
+    #[derive(FromArgs)]
+    struct StringArgs {
+        string: PyObjectRef,
+        #[pyarg(any, default = StringPos(0))]
+        pos: StringPos,
+        // Platform ssize maximum, shown as sys.maxsize.
+        #[pyarg(any, default = StringPos(sys::MAXSIZE as usize), py_default = "sys.maxsize")]
+        endpos: StringPos,
+    }
+
+    #[derive(FromArgs)]
+    struct SubArgs {
+        // repl: Either<ArgCallable, PyStrRef>,
+        repl: PyObjectRef,
+        string: PyObjectRef,
+        #[pyarg(any, default)]
+        count: isize,
+    }
+
+    #[derive(FromArgs)]
+    struct SplitArgs {
+        string: PyObjectRef,
+        #[pyarg(any, default)]
+        maxsplit: isize,
+    }
+
+    #[pyattr]
+    #[pyclass(module = "re", name = "Pattern")]
+    #[derive(Debug, PyPayload)]
+    pub(crate) struct Pattern {
+        pub pattern: PyObjectRef,
+        pub flags: i32,
+        pub code: Vec<u32>,
+        pub groups: usize,
+        pub groupindex: PyDictRef,
+        pub indexgroup: Vec<Option<PyStrRef>>,
+        pub isbytes: bool,
+    }
+
+    macro_rules! with_sre_str {
+        ($pattern:expr, $string:expr, $vm:expr, $f:expr) => {
+            with_sre_str!($pattern, $string, $vm, $f, None::<&PyBuffer>)
+        };
+        ($pattern:expr, $string:expr, $vm:expr, $f:expr, $buffer:expr) => {{
+            // Bind once: the branches only borrow the subject, and callers pass
+            // a temporary (`&x.clone()`) that would otherwise be rebuilt per arm.
+            let subject = $string;
+            if let Some(buffer) = $buffer {
+                buffer.contiguous_or_collect($f)
+            } else if $pattern.isbytes {
+                Pattern::with_bytes(subject, $vm, $f)
+            } else if Pattern::is_ascii_str(subject) {
+                Pattern::with_ascii_str(subject, $vm, $f)
+            } else {
+                Pattern::with_utf8_str(subject, $vm, $f)
+            }
+        }};
+    }
+
+    impl Pattern {
+        fn downcast_str<'a>(string: &'a PyObject, vm: &VirtualMachine) -> PyResult<&'a Py<PyStr>> {
+            string.downcast_ref::<PyStr>().ok_or_else(|| {
+                vm.new_type_error(format!("expected string got '{}'", string.class()))
+            })
+        }
+
+        /// Whether a `str` subject can take the [`AsciiStr`] drive.
+        ///
+        /// `PyStr` already knows: `StrKind` is decided when the string is
+        /// built, so this is a field load rather than a scan. A non-`str`
+        /// argument answers `false` and is reported by [`Self::with_utf8_str`].
+        fn is_ascii_str(string: &PyObject) -> bool {
+            string
+                .downcast_ref::<PyStr>()
+                .is_some_and(|s| s.kind().is_ascii())
+        }
+
+        fn with_ascii_str<F, R>(string: &PyObject, vm: &VirtualMachine, f: F) -> PyResult<R>
+        where
+            F: FnOnce(AsciiStr<'_>) -> PyResult<R>,
+        {
+            let string = Self::downcast_str(string, vm)?;
+            f(AsciiStr(string.as_wtf8().as_bytes()))
+        }
+
+        fn with_utf8_str<F, R>(string: &PyObject, vm: &VirtualMachine, f: F) -> PyResult<R>
+        where
+            F: FnOnce(Utf8Str<'_>) -> PyResult<R>,
+        {
+            f(Utf8Str(Self::downcast_str(string, vm)?))
+        }
+
+        fn with_bytes<F, R>(string: &PyObject, vm: &VirtualMachine, f: F) -> PyResult<R>
+        where
+            F: FnOnce(&[u8]) -> PyResult<R>,
+        {
+            PyBuffer::from_object(vm, string, BufferFlags::SIMPLE)?.contiguous_or_collect(f)
+        }
+
+        fn sub_impl(
+            zelf: &Py<Self>,
+            sub_args: SubArgs,
+            subn: bool,
+            vm: &VirtualMachine,
+        ) -> PyResult {
+            let SubArgs {
+                repl,
+                string,
+                count,
+            } = sub_args;
+
+            enum FilterType<'a> {
+                Literal(PyObjectRef),
+                Callable(PyCallable<'a>),
+                Template(PyRef<Template>),
+            }
+
+            let filter = if let Some(callable) = repl.to_callable() {
+                FilterType::Callable(callable)
+            } else {
+                // Literal detection is independent of the pattern's type. A
+                // mismatched literal only fails when a match actually uses it.
+                // Other objects must go through re's template compiler, which
+                // also supplies the replacement conversion errors.
+                let literal = if let Some(repl) = repl.downcast_ref::<PyStr>() {
+                    !repl.as_wtf8().contains("\\".as_ref())
+                } else {
+                    Self::with_bytes(&repl, vm, |x| Ok(!x.contains(&b'\\'))).unwrap_or(false)
+                };
+                if literal {
+                    FilterType::Literal(repl)
+                } else {
+                    let template = Template::compile(zelf.to_owned(), repl, vm)?;
+                    if template.items.is_empty() {
+                        FilterType::Literal(template.literal.clone())
+                    } else {
+                        FilterType::Template(template)
+                    }
+                }
+            };
+
+            // Keep the export until searching finishes, but never hold a byte
+            // borrow while invoking a replacement. Callbacks may mutate bytes
+            // in place or inspect their match; resizing must remain forbidden.
+            let buffer = if zelf.isbytes {
+                Some(PyBuffer::from_object(vm, &string, BufferFlags::SIMPLE)?)
+            } else {
+                Self::downcast_str(&string, vm)?;
+                None
+            };
+            let mut sub_list: Vec<PyObjectRef> = Vec::new();
+            let mut n = 0;
+            let mut last_pos = 0;
+            let mut must_advance = false;
+            let mut state = State::default();
+
+            while count == 0 || n < count {
+                let matched = with_sre_str!(
+                    zelf,
+                    &string,
+                    vm,
+                    |s| {
+                        let mut req = s.create_request(zelf, last_pos, usize::MAX);
+                        req.must_advance = must_advance;
+                        // Reuse mark storage, replacing the cursor with one
+                        // from this borrow before the engine can read it.
+                        state.reset(&req, last_pos);
+                        if !state.search(req) {
+                            return Ok(None);
+                        }
+
+                        if last_pos < state.start {
+                            sub_list.push(s.slice(last_pos, state.start, vm));
+                        }
+                        last_pos = state.cursor.position;
+                        must_advance = last_pos == state.start;
+                        let callback = match &filter {
+                            FilterType::Literal(literal) => {
+                                sub_list.push(literal.clone());
+                                None
+                            }
+                            FilterType::Template(template) => {
+                                let matched =
+                                    Match::new(&mut state, zelf.to_owned(), string.clone());
+                                matched.expand_template(template, s, &mut sub_list, vm);
+                                None
+                            }
+                            FilterType::Callable(callable) => {
+                                let mut matched =
+                                    Match::new(&mut state, zelf.to_owned(), string.clone());
+                                matched.pos = 0;
+                                matched.endpos = s.count();
+                                Some((matched, callable))
+                            }
+                        };
+                        Ok(Some(callback))
+                    },
+                    buffer.as_ref()
+                )?;
+                let Some(matched) = matched else {
+                    break;
+                };
+
+                if let Some((matched, callable)) = matched {
+                    // Only offsets and the original subject escape the search
+                    // borrow. Reacquiring it next time observes in-place edits.
+                    let replacement = callable.invoke((matched.into_ref(&vm.ctx),), vm)?;
+                    if !vm.is_none(&replacement) {
+                        sub_list.push(replacement);
+                    }
+                }
+                n += 1;
+            }
+
+            with_sre_str!(
+                zelf,
+                &string,
+                vm,
+                |s| {
+                    if last_pos < s.count() {
+                        sub_list.push(s.slice(last_pos, s.count(), vm));
+                    }
+                    Ok(())
+                },
+                buffer.as_ref()
+            )?;
+            // Joining can itself access buffer-valued replacements. Release
+            // the subject export and replacement filter before that step.
+            drop(buffer);
+            drop(filter);
+            let list = PyList::from(sub_list).into_pyobject(vm);
+            let join_type: PyObjectRef = if zelf.isbytes {
+                vm.ctx.new_bytes(vec![]).into()
+            } else {
+                vm.ctx.new_str(ascii!("")).into()
+            };
+            let ret = vm.call_method(&join_type, "join", (list,))?;
+            Ok(if subn { (ret, n).to_pyobject(vm) } else { ret })
+        }
+    }
+
+    #[pyclass(
+        itemsize = core::mem::size_of::<u32>(),
+        with(Hashable, Comparable, Representable),
+        flags(HAS_WEAKREF)
+    )]
+    impl Py<Pattern> {
+        #[pymethod]
+        fn __copy__(zelf: PyRef<Pattern>) -> PyRef<Pattern> {
+            zelf
+        }
+
+        #[pymethod]
+        fn __deepcopy__(zelf: PyRef<Pattern>, _memo: PyObjectRef) -> PyRef<Pattern> {
+            zelf
+        }
+
+        #[pymethod(name = "prefixmatch")]
+        #[pymethod(name = "match")]
+        fn py_match(
+            zelf: PyRef<Pattern>,
+            string_args: StringArgs,
+            vm: &VirtualMachine,
+        ) -> PyResult<Option<PyRef<Match>>> {
+            let StringArgs {
+                string,
+                pos,
+                endpos,
+            } = string_args;
+            with_sre_str!(zelf, &string.clone(), vm, |x| {
+                let req = x.create_request(&zelf, pos.0, endpos.0);
+                let mut state = State::default();
+                Ok(state
+                    .py_match(&req)
+                    .then(|| Match::new(&mut state, zelf.clone(), string).into_ref(&vm.ctx)))
+            })
+        }
+
+        #[pymethod]
+        fn fullmatch(
+            zelf: PyRef<Pattern>,
+            string_args: StringArgs,
+            vm: &VirtualMachine,
+        ) -> PyResult<Option<PyRef<Match>>> {
+            with_sre_str!(zelf, &string_args.string.clone(), vm, |x| {
+                let mut req = x.create_request(&zelf, string_args.pos.0, string_args.endpos.0);
+                req.match_all = true;
+                let mut state = State::default();
+                Ok(state.py_match(&req).then(|| {
+                    Match::new(&mut state, zelf.clone(), string_args.string).into_ref(&vm.ctx)
+                }))
+            })
+        }
+
+        #[pymethod]
+        fn search(
+            zelf: PyRef<Pattern>,
+            string_args: StringArgs,
+            vm: &VirtualMachine,
+        ) -> PyResult<Option<PyRef<Match>>> {
+            with_sre_str!(zelf, &string_args.string.clone(), vm, |x| {
+                let req = x.create_request(&zelf, string_args.pos.0, string_args.endpos.0);
+                let mut state = State::default();
+                Ok(state.search(req).then(|| {
+                    Match::new(&mut state, zelf.clone(), string_args.string).into_ref(&vm.ctx)
+                }))
+            })
+        }
+
+        #[pymethod]
+        fn findall(
+            zelf: PyRef<Pattern>,
+            string_args: StringArgs,
+            vm: &VirtualMachine,
+        ) -> PyResult<Vec<PyObjectRef>> {
+            with_sre_str!(zelf, &string_args.string, vm, |s| {
+                let req = s.create_request(&zelf, string_args.pos.0, string_args.endpos.0);
+                let state = State::default();
+                let mut match_list: Vec<PyObjectRef> = Vec::new();
+                let mut iter = SearchIter { req, state };
+
+                // What a group that took no part in the match is reported as.
+                // `findall` hands back the matched text rather than a match
+                // object, so the stand-in has to be an empty value of the type
+                // the pattern works on. `Match.groups` still reports `None` and
+                // is not affected by this.
+                let empty: PyObjectRef = if zelf.isbytes {
+                    vm.ctx.new_bytes(vec![]).into()
+                } else {
+                    vm.ctx.new_str(ascii!("")).into()
+                };
+
+                while iter.next().is_some() {
+                    let m = Match::new(&mut iter.state, zelf.clone(), string_args.string.clone());
+
+                    let item = if zelf.groups == 0 || zelf.groups == 1 {
+                        m.get_slice(zelf.groups, s, vm)
+                            .unwrap_or_else(|| empty.clone())
+                    } else {
+                        m.groups(
+                            DefaultArg {
+                                default: Some(empty.clone()),
+                            },
+                            vm,
+                        )?
+                        .into()
+                    };
+
+                    match_list.push(item);
+                }
+
+                Ok(match_list)
+            })
+        }
+
+        #[pymethod]
+        fn finditer(
+            zelf: PyRef<Pattern>,
+            string_args: StringArgs,
+            vm: &VirtualMachine,
+        ) -> PyResult<PyCallableIterator> {
+            let scanner = Self::scanner(zelf, string_args, vm)?;
+            let search = vm.get_str_method(scanner.into(), "search").unwrap()?;
+            let search = ArgCallable::try_from_object(vm, search)?;
+            let iterator = PyCallableIterator::new(search, vm.ctx.none());
+            Ok(iterator)
+        }
+
+        #[pymethod]
+        fn scanner(
+            zelf: PyRef<Pattern>,
+            string_args: StringArgs,
+            vm: &VirtualMachine,
+        ) -> PyResult<PyRef<SreScanner>> {
+            let buffer = if zelf.isbytes {
+                Some(PyBuffer::from_object(
+                    vm,
+                    &string_args.string,
+                    BufferFlags::SIMPLE,
+                )?)
+            } else {
+                Pattern::downcast_str(&string_args.string, vm)?;
+                None
+            };
+            Ok(SreScanner {
+                pattern: zelf,
+                string: string_args.string,
+                buffer,
+                start: AtomicCell::new(string_args.pos.0),
+                end: string_args.endpos.0,
+                must_advance: AtomicCell::new(false),
+            }
+            .into_ref(&vm.ctx))
+        }
+
+        #[pymethod]
+        fn sub(zelf: PyRef<Pattern>, sub_args: SubArgs, vm: &VirtualMachine) -> PyResult {
+            Pattern::sub_impl(&zelf, sub_args, false, vm)
+        }
+
+        #[pymethod]
+        fn subn(zelf: PyRef<Pattern>, sub_args: SubArgs, vm: &VirtualMachine) -> PyResult {
+            Pattern::sub_impl(&zelf, sub_args, true, vm)
+        }
+
+        #[pymethod]
+        fn split(
+            zelf: PyRef<Pattern>,
+            split_args: SplitArgs,
+            vm: &VirtualMachine,
+        ) -> PyResult<Vec<PyObjectRef>> {
+            with_sre_str!(zelf, &split_args.string, vm, |s| {
+                let req = s.create_request(&zelf, 0, usize::MAX);
+                let state = State::default();
+                let mut split_list: Vec<PyObjectRef> = Vec::new();
+                let mut iter = SearchIter { req, state };
+                let mut n = 0;
+                let mut last = 0;
+
+                while (split_args.maxsplit == 0 || n < split_args.maxsplit) && iter.next().is_some()
+                {
+                    /* get segment before this match */
+                    split_list.push(s.slice(last, iter.state.start, vm));
+
+                    let m = Match::new(&mut iter.state, zelf.clone(), split_args.string.clone());
+
+                    // add groups (if any)
+                    for i in 1..=zelf.groups {
+                        split_list.push(m.get_slice(i, s, vm).unwrap_or_else(|| vm.ctx.none()));
+                    }
+
+                    n += 1;
+                    last = iter.state.cursor.position;
+                }
+
+                // get segment following last match (even if empty)
+                split_list.push(req.string.slice(last, s.count(), vm));
+
+                Ok(split_list)
+            })
+        }
+
+        #[pygetset]
+        fn flags(&self) -> i32 {
+            self.flags
+        }
+
+        #[pygetset]
+        fn groupindex(&self, vm: &VirtualMachine) -> PyObjectRef {
+            // A pattern with no named group hands back a plain dict.
+            if self.groupindex.is_empty() {
+                return vm.ctx.new_dict().into();
+            }
+            PyMappingProxy::from(self.groupindex.clone())
+                .into_ref(&vm.ctx)
+                .into()
+        }
+
+        #[pygetset]
+        fn groups(&self) -> usize {
+            self.groups
+        }
+
+        #[pygetset]
+        fn pattern(&self) -> PyObjectRef {
+            self.pattern.clone()
+        }
+
+        #[pyclassmethod]
+        fn __class_getitem__(
+            cls: PyTypeRef,
+            object: PyObjectRef,
+            vm: &VirtualMachine,
+        ) -> PyResult<PyGenericAlias> {
+            PyGenericAlias::from_args(cls, object, vm)
+        }
+    }
+
+    impl Hashable for Pattern {
+        fn hash(zelf: &crate::Py<Self>, vm: &VirtualMachine) -> PyResult<PyHash> {
+            let hash = zelf.pattern.hash(vm)?;
+            let (_, code, _) = unsafe { zelf.code.align_to::<u8>() };
+            let hash = hash ^ crate::vm::hash_secret().hash_bytes(code);
+            let hash = hash ^ (zelf.flags as PyHash);
+            let hash = hash ^ (zelf.isbytes as PyHash);
+            Ok(hash)
+        }
+    }
+
+    impl Comparable for Pattern {
+        fn cmp(
+            zelf: &crate::Py<Self>,
+            other: &PyObject,
+            op: crate::types::PyComparisonOp,
+            vm: &VirtualMachine,
+        ) -> PyResult<PyComparisonValue> {
+            if let Some(res) = op.identical_optimization(zelf, other) {
+                return Ok(res.into());
+            }
+            op.eq_only(|| {
+                if let Some(other) = other.downcast_ref::<Self>() {
+                    Ok(PyComparisonValue::Implemented(
+                        zelf.flags == other.flags
+                            && zelf.isbytes == other.isbytes
+                            && zelf.code == other.code
+                            && vm.bool_eq(&zelf.pattern, &other.pattern)?,
+                    ))
+                } else {
+                    Ok(PyComparisonValue::NotImplemented)
+                }
+            })
+        }
+    }
+
+    impl Representable for Pattern {
+        #[inline]
+        fn repr_wtf8(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<Wtf8Buf> {
+            let flag_names = [
+                ("re.IGNORECASE", SreFlag::IGNORECASE),
+                ("re.LOCALE", SreFlag::LOCALE),
+                ("re.MULTILINE", SreFlag::MULTILINE),
+                ("re.DOTALL", SreFlag::DOTALL),
+                ("re.UNICODE", SreFlag::UNICODE),
+                ("re.VERBOSE", SreFlag::VERBOSE),
+                ("re.DEBUG", SreFlag::DEBUG),
+                ("re.ASCII", SreFlag::ASCII),
+            ];
+
+            /* Omit re.UNICODE for valid string patterns. */
+            let mut flags = zelf.flags;
+            if !zelf.isbytes
+                && (flags & i32::from((SreFlag::LOCALE | SreFlag::UNICODE | SreFlag::ASCII).bits()))
+                    == i32::from(SreFlag::UNICODE.bits())
+            {
+                flags &= !i32::from(SreFlag::UNICODE.bits());
+            }
+
+            let mut flag_items = Vec::new();
+            for (name, flag) in flag_names {
+                let flag = i32::from(flag.bits());
+                if flags & flag != 0 {
+                    flag_items.push(name.to_owned());
+                    flags &= !flag;
+                }
+            }
+            if flags != 0 {
+                flag_items.push(format!("0x{:x}", flags as u32));
+            }
+            let flags = flag_items.join("|");
+
+            let pattern = zelf.pattern.repr(vm)?;
+            let mut result = Wtf8Buf::from("re.compile(");
+            let pat = if pattern.char_len() > 200 {
+                pattern.as_wtf8().code_points().take(200).collect()
+            } else {
+                pattern.as_wtf8().to_owned()
+            };
+            result.push_wtf8(&pat);
+            if !flags.is_empty() {
+                result.push_str(", ");
+                result.push_str(&flags);
+            }
+            result.push_char(')');
+            Ok(result)
+        }
+    }
+
+    #[pyattr]
+    #[pyclass(module = "re", name = "Match")]
+    #[derive(Debug, PyPayload)]
+    pub(crate) struct Match {
+        string: PyObjectRef,
+        pattern: PyRef<Pattern>,
+        pos: usize,
+        endpos: usize,
+        lastindex: isize,
+        regs: Vec<(isize, isize)>,
+    }
+
+    impl Match {
+        pub(crate) fn new(state: &mut State, pattern: PyRef<Pattern>, string: PyObjectRef) -> Self {
+            let string_position = state.cursor.position;
+            let marks = &state.marks;
+            let mut regs = vec![(state.start as isize, string_position as isize)];
+            for group in 0..pattern.groups {
+                let mark_index = 2 * group;
+                if mark_index + 1 < marks.raw().len() {
+                    let start = marks.raw()[mark_index];
+                    let end = marks.raw()[mark_index + 1];
+                    if start.is_some() && end.is_some() {
+                        regs.push((start.unpack() as isize, end.unpack() as isize));
+                        continue;
+                    }
+                }
+                regs.push((-1, -1));
+            }
+            Self {
+                string,
+                pattern,
+                pos: state.start,
+                endpos: string_position,
+                lastindex: marks.last_index(),
+                regs,
+            }
+        }
+
+        fn __getitem__(
+            &self,
+            group: PyObjectRef,
+            vm: &VirtualMachine,
+        ) -> PyResult<Option<PyObjectRef>> {
+            with_sre_str!(self.pattern, &self.string, vm, |str_drive| {
+                let i = self
+                    .get_index(&group, vm)
+                    .ok_or_else(|| vm.new_index_error("no such group"))?;
+                Ok(self.get_slice(i, str_drive, vm))
+            })
+        }
+
+        fn get_index(&self, group: &PyObject, vm: &VirtualMachine) -> Option<usize> {
+            let i = if let Ok(i) = group.try_index(vm) {
+                i
+            } else {
+                self.pattern
+                    .groupindex
+                    .get_item_opt(group, vm)
+                    .ok()??
+                    .downcast::<PyInt>()
+                    .ok()?
+            };
+            let i = i.as_bigint().to_isize()?;
+            if i >= 0 && i as usize <= self.pattern.groups {
+                Some(i as usize)
+            } else {
+                None
+            }
+        }
+
+        fn get_slice<S: SreStr>(
+            &self,
+            index: usize,
+            str_drive: S,
+            vm: &VirtualMachine,
+        ) -> Option<PyObjectRef> {
+            let (start, end) = self.regs[index];
+            if start < 0 || end < 0 {
+                return None;
+            }
+            Some(str_drive.slice(start as usize, end as usize, vm))
+        }
+
+        /// Expand an already-compiled template against this match, appending the
+        /// resulting literal/group segments to `list`. Shared by `expand` and
+        /// `Pattern.sub` so the template-filling logic lives in one place; the
+        /// caller is responsible for compiling the template (once) beforehand.
+        fn expand_template<S: SreStr>(
+            &self,
+            template: &Template,
+            str_drive: S,
+            list: &mut Vec<PyObjectRef>,
+            vm: &VirtualMachine,
+        ) {
+            list.push(template.literal.clone());
+            for (index, literal) in template.items.iter().cloned() {
+                if let Some(item) = self.get_slice(index, str_drive, vm) {
+                    list.push(item);
+                }
+                list.push(literal);
+            }
+        }
+
+        fn groups(&self, args: DefaultArg, vm: &VirtualMachine) -> PyResult<PyTupleRef> {
+            let default = args.default.unwrap_or_else(|| vm.ctx.none());
+
+            with_sre_str!(self.pattern, &self.string, vm, |str_drive| {
+                let v: Vec<PyObjectRef> = (1..self.regs.len())
+                    .map(|i| {
+                        self.get_slice(i, str_drive, vm)
+                            .map_or_else(|| default.clone(), |s| s.to_pyobject(vm))
+                    })
+                    .collect();
+                Ok(PyTuple::new_ref(v, &vm.ctx))
+            })
+        }
+    }
+
+    #[pyclass(
+        itemsize = core::mem::size_of::<isize>(),
+        with(AsMapping, Representable),
+        flags(DISALLOW_INSTANTIATION)
+    )]
+    impl Py<Match> {
+        #[pymethod]
+        fn __copy__(zelf: PyRef<Match>) -> PyRef<Match> {
+            zelf
+        }
+
+        #[pymethod]
+        fn __deepcopy__(zelf: PyRef<Match>, _memo: PyObjectRef) -> PyRef<Match> {
+            zelf
+        }
+
+        #[pygetset]
+        fn pos(&self) -> usize {
+            self.pos
+        }
+
+        #[pygetset]
+        fn endpos(&self) -> usize {
+            self.endpos
+        }
+
+        #[pygetset]
+        fn lastindex(&self) -> Option<isize> {
+            if self.lastindex >= 0 {
+                Some(self.lastindex)
+            } else {
+                None
+            }
+        }
+
+        #[pygetset]
+        fn lastgroup(&self) -> Option<PyStrRef> {
+            let i = self.lastindex.to_usize()?;
+            self.pattern.indexgroup.get(i)?.clone()
+        }
+
+        #[pygetset]
+        fn re(&self) -> PyRef<Pattern> {
+            self.pattern.clone()
+        }
+
+        #[pygetset]
+        fn string(&self) -> PyObjectRef {
+            self.string.clone()
+        }
+
+        #[pygetset]
+        fn regs(&self, vm: &VirtualMachine) -> PyTupleRef {
+            PyTuple::new_ref(
+                self.regs.iter().map(|&x| x.to_pyobject(vm)).collect(),
+                &vm.ctx,
+            )
+        }
+
+        #[pymethod]
+        fn start(&self, args: GroupArg, vm: &VirtualMachine) -> PyResult<isize> {
+            self.span(args, vm).map(|x| x.0)
+        }
+
+        #[pymethod]
+        fn end(&self, args: GroupArg, vm: &VirtualMachine) -> PyResult<isize> {
+            self.span(args, vm).map(|x| x.1)
+        }
+
+        #[pymethod]
+        fn span(&self, args: GroupArg, vm: &VirtualMachine) -> PyResult<(isize, isize)> {
+            let GroupArg { group } = args;
+            let index = self
+                .get_index(&group, vm)
+                .ok_or_else(|| vm.new_index_error("no such group"))?;
+            Ok(self.regs[index])
+        }
+
+        #[pymethod]
+        fn expand(
+            zelf: PyRef<Match>,
+            ExpandArgs { template }: ExpandArgs,
+            vm: &VirtualMachine,
+        ) -> PyResult {
+            let template = Template::compile(zelf.pattern.clone(), template, vm)?;
+            with_sre_str!(zelf.pattern, &zelf.string, vm, |s| {
+                let mut list: Vec<PyObjectRef> = Vec::new();
+                zelf.expand_template(&template, s, &mut list, vm);
+
+                let join_type: PyObjectRef = if zelf.pattern.isbytes {
+                    vm.ctx.new_bytes(vec![]).into()
+                } else {
+                    vm.ctx.new_str(ascii!("")).into()
+                };
+                vm.call_method(&join_type, "join", (PyList::from(list).into_pyobject(vm),))
+            })
+        }
+
+        #[pymethod]
+        fn group(&self, args: PosArgs<PyObjectRef>, vm: &VirtualMachine) -> PyResult {
+            with_sre_str!(self.pattern, &self.string, vm, |str_drive| {
+                let args = args.into_vec();
+                if args.is_empty() {
+                    return Ok(self.get_slice(0, str_drive, vm).unwrap().to_pyobject(vm));
+                }
+                let mut v: Vec<PyObjectRef> = args
+                    .into_iter()
+                    .map(|x| {
+                        self.get_index(&x, vm)
+                            .ok_or_else(|| vm.new_index_error("no such group"))
+                            .map(|index| {
+                                self.get_slice(index, str_drive, vm)
+                                    .map_or_else(|| vm.ctx.none(), |x| x.to_pyobject(vm))
+                            })
+                    })
+                    .try_collect()?;
+                if v.len() == 1 {
+                    Ok(v.pop().unwrap())
+                } else {
+                    Ok(vm.ctx.new_tuple(v).into())
+                }
+            })
+        }
+
+        #[pymethod]
+        fn groups(&self, args: DefaultArg, vm: &VirtualMachine) -> PyResult<PyTupleRef> {
+            self.payload.groups(args, vm)
+        }
+
+        #[pymethod]
+        fn groupdict(&self, args: DefaultArg, vm: &VirtualMachine) -> PyResult<PyDictRef> {
+            let default = args.default.unwrap_or_else(|| vm.ctx.none());
+
+            with_sre_str!(self.pattern, &self.string, vm, |str_drive| {
+                let dict = vm.ctx.new_dict();
+
+                for (key, index) in self.pattern.groupindex.clone() {
+                    let value = self
+                        .get_index(&index, vm)
+                        .and_then(|x| self.get_slice(x, str_drive, vm))
+                        .map_or_else(|| default.clone(), |x| x.to_pyobject(vm));
+                    dict.set_item(&*key, value, vm)?;
+                }
+                Ok(dict)
+            })
+        }
+
+        #[pyclassmethod]
+        fn __class_getitem__(
+            cls: PyTypeRef,
+            object: PyObjectRef,
+            vm: &VirtualMachine,
+        ) -> PyResult<PyGenericAlias> {
+            PyGenericAlias::from_args(cls, object, vm)
+        }
+    }
+
+    impl AsMapping for Match {
+        fn as_mapping() -> &'static PyMappingMethods {
+            static AS_MAPPING: crate::common::lock::LazyLock<PyMappingMethods> =
+                crate::common::lock::LazyLock::new(|| PyMappingMethods {
+                    subscript: atomic_func!(|mapping, needle, vm| {
+                        Match::mapping_downcast(mapping)
+                            .__getitem__(needle.to_owned(), vm)
+                            .map(|x| x.to_pyobject(vm))
+                    }),
+                    ..PyMappingMethods::NOT_IMPLEMENTED
+                });
+            &AS_MAPPING
+        }
+    }
+
+    impl Representable for Match {
+        #[inline]
+        fn repr_wtf8(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<Wtf8Buf> {
+            with_sre_str!(zelf.pattern, &zelf.string, vm, |str_drive| {
+                let match_repr = zelf.get_slice(0, str_drive, vm).unwrap().repr(vm)?;
+                Ok(wtf8_concat!(
+                    "<re.Match object; span=(",
+                    zelf.regs[0].0,
+                    ", ",
+                    zelf.regs[0].1,
+                    "), match=",
+                    match_repr.as_wtf8(),
+                    '>',
+                ))
+            })
+        }
+    }
+
+    #[pyattr]
+    #[pyclass(name = "SRE_Scanner", traverse)]
+    #[derive(Debug, PyPayload)]
+    struct SreScanner {
+        pattern: PyRef<Pattern>,
+        string: PyObjectRef,
+        buffer: Option<PyBuffer>,
+        #[pytraverse(skip)]
+        start: AtomicCell<usize>,
+        #[pytraverse(skip)]
+        end: usize,
+        #[pytraverse(skip)]
+        must_advance: AtomicCell<bool>,
+    }
+
+    #[pyclass(with(Py))]
+    impl SreScanner {}
+
+    #[pyclass]
+    impl Py<SreScanner> {
+        #[pygetset]
+        fn pattern(&self) -> PyRef<Pattern> {
+            self.pattern.clone()
+        }
+
+        #[pymethod(name = "prefixmatch")]
+        #[pymethod(name = "match")]
+        fn py_match(&self, vm: &VirtualMachine) -> PyResult<Option<PyRef<Match>>> {
+            with_sre_str!(
+                self.pattern,
+                &self.string.clone(),
+                vm,
+                |s| {
+                    let mut req = s.create_request(&self.pattern, self.start.load(), self.end);
+                    let mut state = State::default();
+                    req.must_advance = self.must_advance.load();
+                    let has_matched = state.py_match(&req);
+
+                    self.must_advance
+                        .store(state.cursor.position == state.start);
+                    self.start.store(state.cursor.position);
+
+                    Ok(has_matched.then(|| {
+                        Match::new(&mut state, self.pattern.clone(), self.string.clone())
+                            .into_ref(&vm.ctx)
+                    }))
+                },
+                self.buffer.as_ref()
+            )
+        }
+
+        #[pymethod]
+        fn search(&self, vm: &VirtualMachine) -> PyResult<Option<PyRef<Match>>> {
+            if self.start.load() > self.end {
+                return Ok(None);
+            }
+            with_sre_str!(
+                self.pattern,
+                &self.string.clone(),
+                vm,
+                |s| {
+                    let mut req = s.create_request(&self.pattern, self.start.load(), self.end);
+                    let mut state = State::default();
+                    req.must_advance = self.must_advance.load();
+
+                    let has_matched = state.search(req);
+
+                    self.must_advance
+                        .store(state.cursor.position == state.start);
+                    self.start.store(state.cursor.position);
+
+                    Ok(has_matched.then(|| {
+                        Match::new(&mut state, self.pattern.clone(), self.string.clone())
+                            .into_ref(&vm.ctx)
+                    }))
+                },
+                self.buffer.as_ref()
+            )
+        }
+    }
+}
